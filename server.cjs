@@ -7,6 +7,8 @@
  *   POST /v1/messages            (stream + non-stream)
  *   GET  /v1/models
  *   POST /v1/messages/count_tokens
+ *   GET  /v1/offpeak              list idle-time tasks (live refresh)
+ *   POST /v1/offpeak              queue an idle-time task {title, prompt, ...}
  *   GET  /healthz
  *
  * Run with system Node, or without any Node install via:
@@ -49,6 +51,9 @@ function loadConfig() {
 const cfg = loadConfig();
 const log = (...a) => console.log('[bridge]', new Date().toISOString(), ...a);
 const manager = new AgentManager(cfg, (...a) => log('[agent]', ...a));
+const { OffPeakManager, OffPeakApiError } = require('./lib/offpeak.cjs');
+const offPeak = new OffPeakManager({ manager, dir: cfg.offpeakDir, logger: (...a) => log('[offpeak]', ...a) });
+offPeak.start();
 
 // conversation continuity: prevKey -> sessionId, sessionId -> fullKey
 const convCache = new Map();
@@ -224,6 +229,52 @@ async function handleModels(req, res) {
   }
 }
 
+// ---------------------------------------------------------------- off-peak
+/** GET /v1/offpeak — list idle-time tasks (live refresh). POST /v1/offpeak — create one. */
+async function handleOffpeakList(req, res) {
+  try {
+    const refresh = !/[?&]refresh=0/.test(req.url || '');
+    const result = await offPeak.list({ refresh });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(result));
+  } catch (e) {
+    facade.anthropicError(res, 500, 'api_error', e.message);
+  }
+}
+
+async function handleOffpeakCreate(req, res) {
+  let body;
+  try {
+    const raw = await readBody(req);
+    body = JSON.parse(raw.toString('utf8'));
+  } catch (e) {
+    return facade.anthropicError(res, 400, 'invalid_request_error', `invalid JSON body: ${e.message}`);
+  }
+  try {
+    const task = await offPeak.create({
+      title: body.title,
+      prompt: body.prompt,
+      workspace: body.workspace,
+      model: body.model,
+      permissionMode: body.permission_mode || body.permissionMode,
+      thoughtLevel: body.thought_level || body.thoughtLevel,
+      sessionId: body.session_id || body.sessionId || body.boundSessionId,
+    });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(task));
+  } catch (e) {
+    if (e instanceof OffPeakApiError) {
+      const status = e.kind === 'eligibility' ? 403 : e.kind === 'quota' || e.kind === 'rate_limited' ? 429 : 502;
+      res.writeHead(status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ type: 'error', error: { type: 'offpeak_request_error', message: e.describe(), kind: e.kind, nextAllowedAt: iso(e.nextTakeAt) } }));
+      return;
+    }
+    facade.anthropicError(res, 400, 'invalid_request_error', e.message);
+  }
+}
+
+function iso(epoch) { return epoch ? new Date(epoch).toISOString() : null; }
+
 // ---------------------------------------------------------------- server
 const server = http.createServer(async (req, res) => {
   const url = (req.url || '').split('?')[0];
@@ -237,6 +288,8 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && (url === '/v1/messages' || url === '/v1/messages/')) return await handleMessages(req, res);
     if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/')) return await handleModels(req, res);
+    if (req.method === 'GET' && (url === '/v1/offpeak' || url === '/v1/offpeak/')) return await handleOffpeakList(req, res);
+    if (req.method === 'POST' && (url === '/v1/offpeak' || url === '/v1/offpeak/')) return await handleOffpeakCreate(req, res);
     if (req.method === 'POST' && url === '/v1/messages/count_tokens') {
       const raw = await readBody(req).catch(() => Buffer.alloc(0));
       let n = 0;
@@ -252,7 +305,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && (url === '/' || url === '')) {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ service: 'zcode-anthropic-bridge', endpoints: ['/v1/messages', '/v1/models', '/v1/messages/count_tokens', '/healthz'] }));
+      res.end(JSON.stringify({ service: 'zcode-anthropic-bridge', endpoints: ['/v1/messages', '/v1/models', '/v1/messages/count_tokens', '/v1/offpeak', '/healthz'] }));
       return;
     }
     facade.anthropicError(res, 404, 'not_found_error', `no such endpoint: ${req.method} ${url}`);
@@ -273,6 +326,7 @@ server.listen(cfg.port, cfg.bind, () => {
 async function shutdown() {
   log('shutting down…');
   server.close();
+  offPeak.stop();
   await manager.shutdown().catch(() => {});
   process.exit(0);
 }

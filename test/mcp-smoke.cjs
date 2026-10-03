@@ -116,7 +116,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     && wc.status === 'done' && /ASYNC_OK/.test(String(wc.finalText || '')) && inList;
   console.log(asyncOk ? 'ASYNC FLOW OK' : 'ASYNC FLOW FAIL');
 
-  const ok = /MCP_SMOKE_OK/.test(String(text)) && planOk && switchOk && plansOk && asyncOk;
+  // idle-time (off-peak) live section — READ-ONLY (no task created):
+  // allowed models + eligibility, then a live-refresh list.
+  const om = await call('tools/call', { name: 'zcode_offpeak_models', arguments: {} });
+  const omc = (om.result && om.result.structuredContent) || {};
+  console.log('offpeak models =>', JSON.stringify(omc.models || []).slice(0, 200));
+  console.log('offpeak availability =>', JSON.stringify(omc.availability || omc.availabilityError || null).slice(0, 200));
+  const ol = await call('tools/call', { name: 'zcode_offpeak_list', arguments: {} });
+  const olc = (ol.result && ol.result.structuredContent) || { tasks: [] };
+  console.log('offpeak list =>', (olc.tasks || []).length, 'task(s)');
+  const offpeakOk = !om.result.isError && !ol.result.isError && Array.isArray(omc.models) && omc.models.length >= 1
+    && Array.isArray(olc.tasks);
+  console.log(offpeakOk ? 'OFFPEAK (read-only) OK' : 'OFFPEAK (read-only) FAIL');
+
+  const ok = /MCP_SMOKE_OK/.test(String(text)) && planOk && switchOk && plansOk && asyncOk && offpeakOk;
   console.log(ok ? 'SMOKE PASS' : 'SMOKE FAIL');
   child.kill();
   process.exit(ok ? 0 : 1);
