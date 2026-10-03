@@ -77,8 +77,12 @@ A ready-made system prompt for Claude lives in [`CLAUDE-DESKTOP-PROMPT.md`](CLAU
 
 | tool | what it does |
 |---|---|
-| `zcode_agent` | one-shot agent turn (full tool access), progress notifications, per-call model override |
-| `zcode_session_start` / `send` / `status` / `stop` | persistent multi-turn sessions |
+| `zcode_agent` | one-shot agent turn (full tool access), progress notifications, per-call model override; `async: true` returns `{sessionId, turnId, status:"running"}` immediately |
+| `zcode_session_start` / `send` / `status` / `stop` | persistent multi-turn sessions (`start`/`send` also accept `async: true`) |
+| `zcode_session_wait` | block until the current (async) turn finishes — the polling half of `async: true` |
+| `zcode_session_output` | peek at the latest streamed output, non-blocking |
+| `zcode_session_cancel` | cancel the running turn (interrupts via `session/stop`), records status `"cancelled"` |
+| `zcode_sessions_list` | every session in memory **or on disk** — the recovery path for a sessionId lost to a client timeout |
 | `zcode_models` / `zcode_model_set` | list catalog; switch default or live-session model (mid-conversation, history kept) |
 | `zcode_plans` | every plan, which have local credentials, **live token availability** per window |
 | `zcode_plan_switch` | activate another credentialed plan (entitlement push + validation + default model) |
@@ -86,9 +90,52 @@ A ready-made system prompt for Claude lives in [`CLAUDE-DESKTOP-PROMPT.md`](CLAU
 | `zcode_plan_reset` | **consume one banked reset** (irreversible; refuses when nothing is banked) |
 | `zcode_plan_reset_opportunity` | request a new reset opportunity from the backend |
 
+## Async turns (never lose a session to a tool timeout)
+
+A client's MCP tool timeout (~900 s) is shorter than some agent turns. With `async: true` the call returns **immediately** with `{ sessionId, turnId, status: "running" }` — the turn keeps running in the bridge either way:
+
+```
+zcode_session_start   { "initial_prompt": "…", "async": true }   → { sessionId, turnId, status:"running" }
+zcode_session_output  { "session_id": "…" }                      → { status, turnId, tail }        (non-blocking peek)
+zcode_session_wait    { "session_id": "…", "timeout_s": 60 }     → { status: running|done|error|cancelled, … }
+                                                                                                       ↻ repeat until not "running"
+zcode_session_cancel  { "session_id": "…" }                      → { status: "cancelled", interrupted }
+```
+
+`zcode_session_wait` returns `finalText` (when done), `lastOutput`, `usage {input, output, cacheRead}` and `model`. `zcode_agent` and `zcode_session_send` take the same `async: true` flag; blocking behavior is unchanged without it.
+
+Even on the **blocking** path nothing is lost: the sessionId is persisted before the first turn starts, every turn error message contains the sessionId, and `zcode_sessions_list` shows every session this bridge process knows plus every session recorded on disk — so a client that timed out can always find the sessionId again.
+
+## On-disk session status
+
+Every session is mirrored to `statusDir` (config, default `<repo>/out/sessions/`) so external watchers — bash scripts, another terminal — can follow turns without talking to the bridge:
+
+- `<sessionId>.json` — replaced **atomically** (temp file + rename) on every state change and at most every 5 s while streaming. Never partially written.
+- `<sessionId>.log` — one NDJSON line per lifecycle event (`session-created`, `turn-started`, `progress` (≤1/5 s while streaming), `turn-completed`, `turn-failed`, `turn-cancelled`, `cancel-requested`, `model-changed`, `session-closed`), each shaped `{ts, sessionId, event, …}`. A summary, not a transcript.
+
+Schema of `<sessionId>.json` (timestamps are epoch ms):
+
+| field | meaning |
+|---|---|
+| `id` | harness sessionId |
+| `workspace` | absolute workspace path |
+| `model` | `{providerId, modelId, options}` selection |
+| `status` | `idle` \| `running` \| `done` \| `error` \| `cancelled` — the current/last turn's state; terminal values persist between turns |
+| `turnId` | bridge turn id of the current/last turn (`turn-N-…`) |
+| `turns` | number of turns started on this session |
+| `createdAt` / `startedAt` / `finishedAt` / `lastActivity` | epoch ms (start/finish of the current/last turn) |
+| `lastOutputTail` | last ≤2000 chars of streamed assistant text |
+| `finalTextTail` | last ≤2000 chars of the final answer (when done) |
+| `error` | last error message (timeouts included), else `null` |
+| `usage` | `{input, output, cacheRead}` when known, else `null` |
+| `pid` | pid of the bridge process that owns the session |
+| `closed` / `closedAt` | present once the session was closed or reaped |
+
+Example watcher: `while jq -e '.status=="running"' out/sessions/<id>.json >/dev/null; do sleep 5; done; jq -r .finalTextTail out/sessions/<id>.json`
+
 ## Semantics you should know
 
-- **One request = one full agent turn.** The harness agent runs to completion (its own tools, its own judgment); the final answer becomes the assistant message. Trivial replies ~10–20 s; real tasks take as long as they take. First call after idle adds ~10 s of harness startup.
+- **One request = one full agent turn.** The harness agent runs to completion (its own tools, its own judgment); the final answer becomes the assistant message. Trivial replies ~10–20 s; real tasks take as long as they take. First call after idle adds ~10 s of harness startup. MCP turns that may outlive the client's tool timeout should use `async: true` + `zcode_session_wait` (see "Async turns").
 - **Client-sent `tools` are accepted and ignored** — the harness's own toolset runs instead; that's the point. `tool_choice`/`temperature`/`top_p`/`max_tokens`/`stop_sequences` likewise.
 - **Conversation continuity is real**: clients that resend full history (all Anthropic clients) hit a prefix-hash cache that continues the *same* harness session (prompt-cache friendly); on miss, prior history imports into a new session via native `importedHistory`. Retrying an identical completed request forks a new conversation.
 - **Streaming** is standard Anthropic SSE, diffed from the harness message store at ~500 ms granularity — sub-second, not token-level.
@@ -110,6 +157,7 @@ Copy `config.example.json` → `config.json`:
 | `exposeThinking` | `false` | stream harness reasoning as `thinking` blocks |
 | `includeToolActivity` | `false` | log internal tool activity |
 | `turnTimeoutMs` / `sessionIdleMs` | `900000` / `1800000` | turn cap; idle-session reaping |
+| `statusDir` | `<repo>/out/sessions/` | on-disk session status files (see "On-disk session status") |
 
 Env overrides: `ZCODE_EXE`, `ZCODE_BUNDLE`, `ZCODE_DIR`, `ZCODE_HOME`, `ZCODE_BUILTIN_FILE`, `ZCODE_CREDENTIAL_SECRET`, `ZCODE_PLAN_ORIGIN`, `ZCODE_QUOTA_ORIGIN`.
 
@@ -132,17 +180,19 @@ Verified against ZCode desktop 3.14.4 / agent 0.16.9 (see `proto-probe.cjs`, the
 
 ```bash
 bash test/e2e.sh          # facade: health, stream/non-stream, continuity, validation (18 checks)
-node test/mcp-smoke.cjs   # MCP: handshake, agent turn, model switch cycle, plans, quota
+node test/mcp-smoke.cjs   # MCP: handshake, agent turn, model switch cycle, plans, quota, async flow
+node test/async-flow.cjs  # async turns, status files, sessions_list, timeout, cancel (32 checks, mocked protocol — no harness needed)
 ```
 
 ## Project layout
 
 ```
 server.cjs                Anthropic Messages facade (HTTP/SSE)
-mcp-server.cjs            MCP stdio front-end (12 tools)
+mcp-server.cjs            MCP stdio front-end (16 tools)
 lib/harness-env.cjs       install discovery, config reads, credential decryption
 lib/zcode-protocol.cjs    ZCode Protocol client + desktop-host request responders
 lib/agent-manager.cjs     sessions, turns, streaming, history import, model/plan switching
+lib/session-status.cjs    on-disk session status (atomic <id>.json + <id>.log NDJSON)
 lib/coding-plan.cjs       plan quota windows + banked resets (Z.ai backend)
 run-bridge.cmd            launcher on the harness's embedded Node
 CLAUDE-DESKTOP-PROMPT.md  ready-made system prompt for Claude clients
