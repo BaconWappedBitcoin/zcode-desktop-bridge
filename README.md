@@ -256,6 +256,78 @@ Behavior:
   "endsAt": "2026-10-04T12:00:00.000Z", "claimable": true, "claimed": false }
 ```
 
+## Dashboard
+
+A task-tracking console for the bridge — in the spirit of [nightshift](https://github.com/openslop/nightshift) (clock panel, history radar, job matrix, a key to drill into a transcript). It comes in two front-ends sharing one state module (`lib/ui-state.cjs`), and both are **independent of any harness**: they read only the bridge's on-disk state plus the read-only HTTP API, so they work when no MCP client is attached — and even when the bridge process is down, showing the last-known state marked stale.
+
+```bash
+node bin/bridge-ui.cjs                              # full-screen TUI (alternate screen, raw ANSI — no dependencies)
+node bin/bridge-ui.cjs --watch C:/somewhere/_logs   # + generic lane trackers from a watch dir
+node bin/bridge-ui.cjs --root T:/git/zcodeapi       # read another checkout's state
+node server.cjs                                     # then open http://127.0.0.1:8787/ui  (dark, self-contained page)
+```
+
+Panels: **header** clock + bridge up/down (pid/port files, `/healthz`), **PLAN** gauges (5-hour and weekly windows, banked-reset counts with a <2 h expiry warning), **ACTIVE** (running sessions, idle tasks and watched lanes in one table), **HISTORY** (nightshift-style outcome matrix: ✓ done · ✗ failed · ◐ running · ⊘ cancelled · · idle, per hour or per day), **OFFERS** (open offers + resets with expiry countdowns), **EVENTS** (merged NDJSON feed, newest first). Redraws at most 2/s; `fs.watch` nudges a debounced tick with polling as the fallback (Windows network drives). Windows Terminal gets truecolor; conhost falls back to 16 colors; pipes/`--once` render plain.
+
+Keys: `↑/↓` select · `Enter` detail view (full status JSON + log tail, scrollable) · `o` open the transcript/log in the default app · `c` cancel the selected session/idle task — asks `y/N` first, goes through the bridge HTTP API only (`POST /v1/ui/cancel`) · `f` filter (all/running/failed) · `h` history range (24 h/14 d) · `r` refresh · `?` help · `q` quit.
+
+> **The dashboard never claims offers and never spends resets.** Those panels are read-only, with a hint to claim in the ZCode app or spend via `zcode_plan_reset` with your explicit OK. A static test enforces that no dashboard code references the claim or reset-spend endpoints.
+
+Plan usage is polled by the server (and by the TUI when it runs standalone) through the read-only quota APIs **at most every 60 s** and cached in `out/ui/plan.json` — both front-ends share one reading, and the dashboard works offline from that cache.
+
+Extra watch dirs (`uiWatch`) turn any directory of \`<name>.pid / <name>.done / <name>.log\` triplets into tracked lanes (running while the pid is alive, done/failed from `.done`'s \`exit=\` value, last log line as the tail) — kept generic, no project-specific code:
+
+```json
+{ "uiWatch": [ { "name": "game", "dir": "C:/survive2-wt/_logs" } ] }
+```
+
+Live render (140 cols, real out/ dirs + the watch dir above):
+
+```
+zcode-bridge v0.5.0  ● up pid 22668                                                                             filter:all hist:24h 13:39:40
+─ PLAN ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
+ 5h █░░░░░░░░░░░░░░░░░   8% · 26k left · window resets 18:16                                                                                
+ wk ███████░░░░░░░░░░░  41% · 82k left · window resets 07:26                                                                                
+ banked resets: 5h ×2 (in 24d18h) · wk ×2 (in 24d18h)                                                                                       
+─ ACTIVE 57/57 ───────────────────────────────────────────────────────────────────────────────────────────────────────────  filter: all [f] 
+ KIND  NAME                     MODEL          STATUS      ELAPSED  AGE     TAIL                                                            
+›lane f-female                 —              ● running   46m      11s     ZCode Built-in skipped (not-due)                                 
+ lane p-t038                   —              ● running   46m      12s     ZCode Built-in skipped (not-due)                                 
+ lane z-ui                     —              ● running   46m      28s     ZCode Built-in skipped (not-due)                                 
+ lane v-villages-impl          —              ● running   45m      36s     ZCode Built-in skipped (not-due)                                 
+ lane z-map                    —              ● running   46m      41s     ZCode Built-in skipped (not-due)                                 
+ ses  sess_241f185e-113b-4e2b… GLM-5.3-Flash  ✗ error     15m      2m      target-selection change since the escalation. Let me rule out t… 
+ ses  sess_e5d969ec-1e9d-4c4f… GLM-5.3-Flash  ✗ error     15m      8m      the broken escape-sequence parser), then build the web page and… 
+ ses  sess_52fb6917-1655-440a… GLM-5.3-Flash  ✗ error     15m      8m      e 020 HUD spec in full.vs1 spec carries the slice bar; Phase 7 … 
+ ses  sess_ee53550b-d16e-45d6… GLM-5.3-Flash  ✗ error     15m      8m      boards read — found two more concrete items (033's T032 targets… 
+ lane k-qatriage               —              ✓ done      10m      19m     **Respect for the loop rules:** no registry status was changed … 
+ +47 more (filter: all)                                                                                                                     
+─ HISTORY last 24h ─────────────────────────────────────────────────────────────────────────────────────────────────────────────  [h] range 
+ lane:f-female     │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ lane:p-t038       │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ lane:z-ui         │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ lane:v-villages-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ lane:z-map        │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ ses:sess_241f1    │ · · · · · · · · · · · · · · · · · · · · · · · ·                                                                        
+ ses:sess_e5d96    │ · · · · · · · · · · · · · · · · · · · · · · · ·                                                                        
+ ses:sess_52fb6    │ · · · · · · · · · · · · · · · · · · · · · · · ·                                                                        
+                   │ -24h                                         now                                                                       
+─ OFFERS ────────────────────────────────────────────────────────────────────────────────────────────────────────────────  last check 13:36 
+ • 2 banked 5-hour window resets available · ends in 24d18h                                                                                 
+ • 2 banked weekly window resets available · ends in 24d18h                                                                                 
+ claiming is manual (ZCode app) · resets: zcode_plan_reset — never from the UI                                                              
+─ EVENTS ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
+ 13:37:40 sessionturn-error sess_241f185e-113b-4e2b-9d98-03d0315871c {"sessionId":"sess_241f185e-113b-4e2b-9d98-03d0315871ca","turnId":"t…  
+ 13:36:55 sessionprogress sess_241f185e-113b-4e2b-9d98-03d0315871c {"sessionId":"sess_241f185e-113b-4e2b-9d98-03d0315871ca","chars":2000}   
+ 13:36:49 sessionprogress sess_241f185e-113b-4e2b-9d98-03d0315871c {"sessionId":"sess_241f185e-113b-4e2b-9d98-03d0315871ca","chars":2000}   
+ 13:36:28 sessionprogress sess_241f185e-113b-4e2b-9d98-03d0315871c {"sessionId":"sess_241f185e-113b-4e2b-9d98-03d0315871ca","chars":2000}   
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+                                                                                                                                            
+ ↑↓ select · ↵ detail · o open · c cancel · f filter · h range · r refresh · ? help · q quit
+```
+
 ## On-disk session status
 
 Every session is mirrored to `statusDir` (config, default `<repo>/out/sessions/`) so external watchers — bash scripts, another terminal — can follow turns without talking to the bridge:
@@ -312,6 +384,8 @@ Copy `config.example.json` → `config.json`:
 | `offersPollMs` | `600000` | offer-detector poll interval; `0` disables polling (see "Offer notifications") |
 | `offerToasts` | `true` | raise a Windows toast on new claimable offers |
 | `offersDir` | `<repo>/out/offers/` | offer detector state (`state.json`, `events.log`, `poller.pid`) |
+| `uiDir` | `<repo>/out/ui/` | dashboard plan-usage cache (`plan.json`, refreshed read-only every ≤60 s) |
+| `uiWatch` | *(none)* | extra dirs of `<name>.pid/.done/.log` triplets shown as lanes in the dashboard (see "Dashboard") |
 
 Env overrides: `ZCODE_EXE`, `ZCODE_BUNDLE`, `ZCODE_DIR`, `ZCODE_HOME`, `ZCODE_BUILTIN_FILE`, `ZCODE_CREDENTIAL_SECRET`, `ZCODE_PLAN_ORIGIN`, `ZCODE_QUOTA_ORIGIN`.
 
@@ -340,13 +414,17 @@ node test/mcp-smoke.cjs   # MCP: handshake, agent turn, model switch cycle, plan
 node test/async-flow.cjs  # async turns, status files, sessions_list, timeout, cancel (32 checks, mocked protocol — no harness needed)
 node test/offpeak.cjs     # idle-time tasks: create/refresh/dispatch/requeue/pause/cancel + host RPCs (46 checks, mocked ticket API — no network)
 node test/offers.cjs      # offer detection: normalize/dedup/expiry/pid-lock + static no-claim-endpoint guard (35 checks, no network)
+node test/ui-state.cjs    # dashboard: aggregator parsing, stale bridge, history buckets, PlanUsageCache, TUI snapshots 80/140 cols + no-claim guard (85 checks, no network)
 ```
 
 ## Project layout
 
 ```
-server.cjs                Anthropic Messages facade (HTTP/SSE) + /v1/offpeak + /v1/offers
+server.cjs                Anthropic Messages facade (HTTP/SSE) + /v1/offpeak + /v1/offers + /ui dashboard
 mcp-server.cjs            MCP stdio front-end (25 tools)
+bin/bridge-ui.cjs         full-screen TUI dashboard (--once renders one plain frame)
+lib/ui-state.cjs          dashboard state aggregator (pure) + plan-usage disk cache
+lib/ui-html.cjs           the GET /ui page (one self-contained HTML string)
 lib/harness-env.cjs       install discovery, config reads, credential decryption
 lib/zcode-protocol.cjs    ZCode Protocol client + desktop-host request responders
 lib/agent-manager.cjs     sessions, turns, streaming, history import, model/plan switching
@@ -356,7 +434,7 @@ lib/offpeak.cjs           idle-time task host: ticket API, store, poller, run di
 lib/offers.cjs            offer detector: preview/marketing/reset reads, poller, toasts (never claims)
 run-bridge.cmd            launcher on the harness's embedded Node
 CLAUDE-DESKTOP-PROMPT.md  ready-made system prompt for Claude clients
-test/                     e2e + MCP smoke + offpeak + offers suites
+test/                     e2e + MCP smoke + offpeak + offers + ui-state suites
 proto-probe.cjs           protocol exploration harness (dev tool)
 ```
 

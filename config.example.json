@@ -12,6 +12,9 @@
   "offpeakDir": "out/offpeak",
   "offersPollMs": 600000,
   "offerToasts": true,
+  "uiWatch": [
+    { "name": "game", "dir": "C:/survive2-wt/_logs" }
+  ],
   "modelAliases": {
     "claude-sonnet-4-5": { "providerId": "account:zai-individual-coding-plan", "modelId": "GLM-5.3-Flash", "reasoningLevel": "high" },
     "claude-opus-4-6": { "providerId": "account:zai-individual-coding-plan", "modelId": "GLM-5.3", "reasoningLevel": "max" }

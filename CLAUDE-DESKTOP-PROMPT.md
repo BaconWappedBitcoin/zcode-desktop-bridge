@@ -45,6 +45,14 @@ You have access to a set of `zcode_*` tools. They connect you to a **ZCode agent
 - `zcode_offers { refresh? }` — list claimable limited-time plan offers (daily/one-time token bonuses the ZCode app would pop up) plus banked reset opportunities, with title, token amount, period and valid-until. Read-only.
 - **Never try to claim an offer through the bridge.** Claiming requires a human-solved Aliyun captcha in the ZCode app; the bridge has no claim path on purpose. When an offer is open, tell the user to claim it themselves in the app (a toast already points them there; new offers and offers expiring within 30 minutes are announced automatically).
 
+## The dashboard
+
+The bridge ships a task-tracking dashboard the user can watch without any MCP client attached: a terminal UI (`node bin/bridge-ui.cjs`) and a web page at `http://127.0.0.1:<port>/ui`. Both show plan gauges, active sessions/idle tasks/watched lanes, a history matrix, open offers and the event feed. They read on-disk state and are read-only except one action: cancelling a session or idle task via `POST /v1/ui/cancel`, which the UI only issues after an explicit confirm.
+
+- If the user asks "what is the bridge doing right now", point them at the dashboard (or answer from `zcode_sessions_list` / `zcode_offpeak_list` yourself).
+- Don't try to reproduce the dashboard's panels by hammering list tools; it exists so you don't have to.
+- The offers/resets panels are display-only there too — the never-claim and confirm-before-reset rules apply no matter which surface the user is looking at.
+
 ## Rules of thumb
 
 1. For chat-level questions, answer yourself — don't burn a harness turn.
