@@ -174,6 +174,8 @@ zcode_session_cancel  { "session_id": "…" }                      → { status:
 
 `zcode_session_wait` returns `finalText` (when done), `lastOutput`, `usage {input, output, cacheRead}` and `model`. `zcode_agent` and `zcode_session_send` take the same `async: true` flag; blocking behavior is unchanged without it.
 
+**Async turns detach instead of failing.** Blocking calls error at `turnTimeoutMs` (config, default 900 s) as before. Async turns live under a separate, much larger `asyncTurnTimeoutMs` (config, default **6 h**) — and even past that wait deadline the bridge does **not** record an error: the status file keeps saying `"running"` with `detached: true` (plus `waitDeadlineHitAt`), the event log gains a `turn-detached` line, and the bridge keeps consuming the harness's notifications so the status file still reaches `done`/`error`/`cancelled` with the real `finalText` when the turn actually ends. `zcode_session_wait` on a detached turn keeps returning `running` (with the `detached` flag) until then; `zcode_session_cancel` still interrupts it. Before this fix (≤0.5.0), a long async turn was marked `"error"` at 900 s while the harness kept editing files — external watchers reported a false failure and the final text was lost to the status file.
+
 Even on the **blocking** path nothing is lost: the sessionId is persisted before the first turn starts, every turn error message contains the sessionId, and `zcode_sessions_list` shows every session this bridge process knows plus every session recorded on disk — so a client that timed out can always find the sessionId again.
 
 ## Idle-time tasks (off-peak, free)
@@ -275,52 +277,54 @@ Keys: `↑/↓` select · `Enter` detail view (full status JSON + log tail, scro
 
 Plan usage is polled by the server (and by the TUI when it runs standalone) through the read-only quota APIs **at most every 60 s** and cached in `out/ui/plan.json` — both front-ends share one reading, and the dashboard works offline from that cache.
 
-Extra watch dirs (`uiWatch`) turn any directory of \`<name>.pid / <name>.done / <name>.log\` triplets into tracked lanes (running while the pid is alive, done/failed from `.done`'s \`exit=\` value, last log line as the tail) — kept generic, no project-specific code:
+Extra watch dirs (`uiWatch`) turn any directory of `<name>.pid / <name>.done / <name>.log` triplets into tracked lanes (running while the pid is alive, done/failed from `.done`'s `exit=` value, last log line as the tail) — kept generic, no project-specific code:
 
 ```json
 { "uiWatch": [ { "name": "game", "dir": "C:/survive2-wt/_logs" } ] }
 ```
 
+Tails skip harness chatter: `uiTailIgnore` (regex list, default `["Built-in skipped \\(not-due\\)"]`) — the TAIL column shows the last line that matches none of the patterns, so a stream ending in "ZCode Built-in skipped (not-due)" shows its last real line instead. Set `[]` to disable, or add your own regexes.
+
 Live render (140 cols, real out/ dirs + the watch dir above):
 
 ```
-zcode-bridge v0.5.0  ● up pid 22668                                                                             filter:all hist:24h 13:39:40
+zcode-bridge v0.5.1  ● up pid 33876 pid 22668 · :8787                                                           filter:all hist:24h 14:04:10
 ─ PLAN ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
- 5h █░░░░░░░░░░░░░░░░░   8% · 26k left · window resets 18:16                                                                                
- wk ███████░░░░░░░░░░░  41% · 82k left · window resets 07:26                                                                                
+ 5h ███░░░░░░░░░░░░░░░  18% · 23k left · window resets 18:16                                                                                
+ wk ████████░░░░░░░░░░  43% · 79k left · window resets 07:26                                                                                
  banked resets: 5h ×2 (in 24d18h) · wk ×2 (in 24d18h)                                                                                       
-─ ACTIVE 57/57 ───────────────────────────────────────────────────────────────────────────────────────────────────────────  filter: all [f] 
+─ ACTIVE 60/60 ───────────────────────────────────────────────────────────────────────────────────────────────────────────  filter: all [f] 
  KIND  NAME                     MODEL          STATUS      ELAPSED  AGE     TAIL                                                            
-›lane f-female                 —              ● running   46m      11s     ZCode Built-in skipped (not-due)                                 
- lane p-t038                   —              ● running   46m      12s     ZCode Built-in skipped (not-due)                                 
- lane z-ui                     —              ● running   46m      28s     ZCode Built-in skipped (not-due)                                 
- lane v-villages-impl          —              ● running   45m      36s     ZCode Built-in skipped (not-due)                                 
- lane z-map                    —              ● running   46m      41s     ZCode Built-in skipped (not-due)                                 
- ses  sess_241f185e-113b-4e2b… GLM-5.3-Flash  ✗ error     15m      2m      target-selection change since the escalation. Let me rule out t… 
- ses  sess_e5d969ec-1e9d-4c4f… GLM-5.3-Flash  ✗ error     15m      8m      the broken escape-sequence parser), then build the web page and… 
- ses  sess_52fb6917-1655-440a… GLM-5.3-Flash  ✗ error     15m      8m      e 020 HUD spec in full.vs1 spec carries the slice bar; Phase 7 … 
- ses  sess_ee53550b-d16e-45d6… GLM-5.3-Flash  ✗ error     15m      8m      boards read — found two more concrete items (033's T032 targets… 
- lane k-qatriage               —              ✓ done      10m      19m     **Respect for the loop rules:** no registry status was changed … 
- +47 more (filter: all)                                                                                                                     
+›lane survive2:v-villages-impl —              ● running   70m      2s                                                                       
+ lane v-villages-impl          —              ● running   70m      2s                                                                       
+ ses  sess_e5d969ec-1e9d-4c4f… GLM-5.3-Flash  ● running   12m      4s      the harness keeps going. Let me read the remaining pieces — con… 
+ lane survive2:z-map           —              ● running   71m      10s                                                                      
+ lane z-map                    —              ● running   71m      10s                                                                      
+ lane survive2:f-female        —              ● running   16m      22s     AI SDK Warning (anthropic.messages / GLM-5.3): The feature "cac… 
+ lane f-female                 —              ● running   16m      22s     AI SDK Warning (anthropic.messages / GLM-5.3): The feature "cac… 
+ lane survive2:z-world         —              ● running   13m      27s                                                                      
+ lane z-world                  —              ● running   13m      27s                                                                      
+ lane survive2:p-t038          —              ● running   71m      42s                                                                      
+ +50 more (filter: all)                                                                                                                     
 ─ HISTORY last 24h ─────────────────────────────────────────────────────────────────────────────────────────────────────────────  [h] range 
- lane:f-female     │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- lane:p-t038       │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- lane:z-ui         │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ lane:survive2:v-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
  lane:v-villages-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ ses:sess_e5d96    │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ lane:survive2:z-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
  lane:z-map        │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- ses:sess_241f1    │ · · · · · · · · · · · · · · · · · · · · · · · ·                                                                        
- ses:sess_e5d96    │ · · · · · · · · · · · · · · · · · · · · · · · ·                                                                        
- ses:sess_52fb6    │ · · · · · · · · · · · · · · · · · · · · · · · ·                                                                        
+ lane:survive2:f-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ lane:f-female     │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
+ lane:survive2:z-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
                    │ -24h                                         now                                                                       
-─ OFFERS ────────────────────────────────────────────────────────────────────────────────────────────────────────────────  last check 13:36 
+─ OFFERS ────────────────────────────────────────────────────────────────────────────────────────────────────────────────  last check 13:56 
  • 2 banked 5-hour window resets available · ends in 24d18h                                                                                 
  • 2 banked weekly window resets available · ends in 24d18h                                                                                 
  claiming is manual (ZCode app) · resets: zcode_plan_reset — never from the UI                                                              
 ─ EVENTS ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
- 13:37:40 sessionturn-error sess_241f185e-113b-4e2b-9d98-03d0315871c {"sessionId":"sess_241f185e-113b-4e2b-9d98-03d0315871ca","turnId":"t…  
- 13:36:55 sessionprogress sess_241f185e-113b-4e2b-9d98-03d0315871c {"sessionId":"sess_241f185e-113b-4e2b-9d98-03d0315871ca","chars":2000}   
- 13:36:49 sessionprogress sess_241f185e-113b-4e2b-9d98-03d0315871c {"sessionId":"sess_241f185e-113b-4e2b-9d98-03d0315871ca","chars":2000}   
- 13:36:28 sessionprogress sess_241f185e-113b-4e2b-9d98-03d0315871c {"sessionId":"sess_241f185e-113b-4e2b-9d98-03d0315871ca","chars":2000}   
+ 14:04:06 sessionprogress sess_e5d969ec-1e9d-4c4f-b6a7-953a1f26980 {"sessionId":"sess_e5d969ec-1e9d-4c4f-b6a7-953a1f269807","chars":2000}   
+ 14:03:47 sessionprogress sess_e5d969ec-1e9d-4c4f-b6a7-953a1f26980 {"sessionId":"sess_e5d969ec-1e9d-4c4f-b6a7-953a1f269807","chars":2000}   
+ 14:03:21 sessionprogress sess_e5d969ec-1e9d-4c4f-b6a7-953a1f26980 {"sessionId":"sess_e5d969ec-1e9d-4c4f-b6a7-953a1f269807","chars":2000}   
+ 14:03:04 sessionprogress sess_e5d969ec-1e9d-4c4f-b6a7-953a1f26980 {"sessionId":"sess_e5d969ec-1e9d-4c4f-b6a7-953a1f269807","chars":2000}   
                                                                                                                                             
                                                                                                                                             
                                                                                                                                             
@@ -333,7 +337,7 @@ zcode-bridge v0.5.0  ● up pid 22668                                           
 Every session is mirrored to `statusDir` (config, default `<repo>/out/sessions/`) so external watchers — bash scripts, another terminal — can follow turns without talking to the bridge:
 
 - `<sessionId>.json` — replaced **atomically** (temp file + rename) on every state change and at most every 5 s while streaming. Never partially written.
-- `<sessionId>.log` — one NDJSON line per lifecycle event (`session-created`, `turn-started`, `progress` (≤1/5 s while streaming), `turn-completed`, `turn-failed`, `turn-cancelled`, `cancel-requested`, `model-changed`, `session-closed`), each shaped `{ts, sessionId, event, …}`. A summary, not a transcript.
+- `<sessionId>.log` — one NDJSON line per lifecycle event (`session-created`, `turn-started`, `progress` (≤1/5 s while streaming), `turn-detached`, `turn-completed`, `turn-failed`, `turn-cancelled`, `cancel-requested`, `model-changed`, `session-closed`), each shaped `{ts, sessionId, event, …}`. A summary, not a transcript.
 
 Schema of `<sessionId>.json` (timestamps are epoch ms):
 
@@ -351,6 +355,7 @@ Schema of `<sessionId>.json` (timestamps are epoch ms):
 | `error` | last error message (timeouts included), else `null` |
 | `usage` | `{input, output, cacheRead}` when known, else `null` |
 | `pid` | pid of the bridge process that owns the session |
+| `detached` / `waitDeadlineHitAt` | present from when an **async** turn outlived its wait deadline until the next turn starts: the status stays `running` while the bridge follows the harness to the real end (see "Async turns"); the flag persists onto the eventual terminal doc as provenance |
 | `closed` / `closedAt` | present once the session was closed or reaped |
 
 Example watcher: `while jq -e '.status=="running"' out/sessions/<id>.json >/dev/null; do sleep 5; done; jq -r .finalTextTail out/sessions/<id>.json`
@@ -378,7 +383,8 @@ Copy `config.example.json` → `config.json`:
 | `modelAliases` | *(map)* | map request model names → harness selections; unknown models use the harness default |
 | `exposeThinking` | `false` | stream harness reasoning as `thinking` blocks |
 | `includeToolActivity` | `false` | log internal tool activity |
-| `turnTimeoutMs` / `sessionIdleMs` | `900000` / `1800000` | turn cap; idle-session reaping |
+| `turnTimeoutMs` / `sessionIdleMs` | `900000` / `1800000` | blocking-turn cap; idle-session reaping |
+| `asyncTurnTimeoutMs` | `21600000` (6 h) | async-turn wait deadline; past it the turn detaches (status stays `running` + `detached`) instead of erroring (see "Async turns") |
 | `statusDir` | `<repo>/out/sessions/` | on-disk session status files (see "On-disk session status") |
 | `offpeakDir` | `<repo>/out/offpeak/` | on-disk idle-time task files (see "On-disk idle-time task status") |
 | `offersPollMs` | `600000` | offer-detector poll interval; `0` disables polling (see "Offer notifications") |
@@ -386,6 +392,7 @@ Copy `config.example.json` → `config.json`:
 | `offersDir` | `<repo>/out/offers/` | offer detector state (`state.json`, `events.log`, `poller.pid`) |
 | `uiDir` | `<repo>/out/ui/` | dashboard plan-usage cache (`plan.json`, refreshed read-only every ≤60 s) |
 | `uiWatch` | *(none)* | extra dirs of `<name>.pid/.done/.log` triplets shown as lanes in the dashboard (see "Dashboard") |
+| `uiTailIgnore` | `["Built-in skipped \\(not-due\\)"]` | regex sources for dashboard-tail chatter; the tail shows the last line that matches none of them (`[]` disables) |
 
 Env overrides: `ZCODE_EXE`, `ZCODE_BUNDLE`, `ZCODE_DIR`, `ZCODE_HOME`, `ZCODE_BUILTIN_FILE`, `ZCODE_CREDENTIAL_SECRET`, `ZCODE_PLAN_ORIGIN`, `ZCODE_QUOTA_ORIGIN`.
 

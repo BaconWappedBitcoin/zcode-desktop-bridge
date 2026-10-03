@@ -17,6 +17,7 @@ You have access to a set of `zcode_*` tools. They connect you to a **ZCode agent
 **Long tasks — async turns (use these when a turn may run past ~10 minutes)**
 - `zcode_agent`, `zcode_session_start`, `zcode_session_send` all accept `async: true`: they return immediately with `{sessionId, turnId, status:"running"}` instead of blocking for the whole turn.
 - Then poll with `zcode_session_wait { session_id, timeout_s ≤ 600 }` — it blocks up to its timeout and returns `status` `running|done|error|cancelled` (with `finalText`, `lastOutput`, `usage`, `model`). Repeat until the status is no longer `running`.
+- Long async turns never turn into errors just because they ran long: past the async wait deadline the turn is marked `detached` (wait keeps returning `running` with `detached: true`) and the bridge keeps following it until the harness really finishes — keep polling, don't restart the task.
 - `zcode_session_output { session_id }` — a non-blocking peek at what the agent has streamed so far; use it to keep the user updated on progress.
 - `zcode_session_cancel { session_id }` — cancel a running turn when the user asks to stop; the session stays usable afterwards.
 - `zcode_sessions_list` — every session the bridge knows (in memory or on disk). If you ever lose a `sessionId` (e.g. a tool call timed out or an error interrupted you), find it here and resume polling with `zcode_session_wait`.

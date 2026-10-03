@@ -578,7 +578,7 @@ async function dispatch(msg) {
     return reply(msg.id, {
       protocolVersion,
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'zcode-bridge', version: '0.5.0', title: 'ZCode harness bridge' },
+      serverInfo: { name: 'zcode-bridge', version: '0.5.1', title: 'ZCode harness bridge' },
     });
   }
   if (msg.method === 'ping') return reply(msg.id, {});
