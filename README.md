@@ -2,6 +2,29 @@
 
 Expose the **ZCode desktop harness** (Windows) through standard interfaces, so any client can drive the full agent — with the desktop app's machinery, and the desktop-only plan perks the CLI never gets:
 
+## GLM-5.3 and exclusive benefits
+
+With GLM-5.3's long context, ZCode can keep track of more files and longer stretches of development within a single task. It keeps moving forward by combining the current workspace, tool results, and Git changes, so even multi-step tasks don't need their background re-explained.
+
+### Subscriber benefit: idle-time tasks run for free
+
+Subscribers can create idle-time tasks: queue up non-urgent work and ZCode completes it for free during periods of spare capacity, without consuming your plan quota. Rolling out gradually to subscribers.
+
+| | |
+|---|---|
+| Execution cost | Free |
+| Plan quota consumed | 0 |
+
+### New user offer: 5-day free trial
+
+First-time ZCode users get 5 days of free benefits, ready to use out of the box with no setup. Note: the daily quotas below are granted only during these 5 days — they expire afterwards and are not an ongoing daily allowance.
+
+| Model | Daily quota (5 days only) |
+|---|---|
+| GLM-5.3 | 3M tokens / day |
+| GLM-5-turbo | 2M tokens / day |
+| **Daily total** | **5M tokens** |
+
 ## Why?
 
 On a credit-metered coding plan, **the quota window is the real cost** — everything this bridge does exists to spend it better and to never let an empty window stop your work:
