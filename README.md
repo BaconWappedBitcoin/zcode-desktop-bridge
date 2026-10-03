@@ -50,7 +50,7 @@ The same GLM agent ships in two harnesses: the standalone CLI (`resources/glm/zc
 
 | Benefit | ZCode CLI (`-p` headless) | ZCode desktop (via this bridge) |
 |---|---|---|
-| Token output per turn | unverified | ✓ owner-reported ~50% more tokens than the CLI ¹ |
+| Quota campaigns (see the callout above) | ? CLI reports its own version (0.16.9); docs don't say whether it counts as "ZCode 3.10+" ¹ | ✓ desktop 3.14.4 qualifies: GLM-5.3-Flash at zero quota 23:00–09:00 UTC+8 until Oct 7, 2026 ¹ |
 | Banked 5-hour / weekly plan resets | ✗ no reset API calls in the CLI ² | ✓ see, request, and spend them (`zcode_plan_reset`) |
 | Live plan usage windows (5h / weekly) | ✗ no quota API calls in the CLI ² | ✓ `zcode_plans` / `zcode_plan_usage` |
 | Switch between credentialed plans | unverified | ✓ `zcode_plan_switch` (live-verified) |
@@ -64,7 +64,7 @@ The same GLM agent ships in two harnesses: the standalone CLI (`resources/glm/zc
 | GUI, notifications, tray | ✗ terminal only | ✓ (the desktop app itself) |
 | 5-day free-trial quotas | ✓ account-level, so either harness ⁵ | ✓ ⁵ |
 
-¹ Reported by the owner from side-by-side use; not found in code. ² Verified by decoding `zcode.cjs` (0 references to the reset or quota endpoints) and the desktop host (both live-verified through this bridge). ³ The CLI bundle *contains* the `OffPeakCreate` agent tool, but idle-time tasks are serviced by the **host** (`offPeak/create` is a server→client request); the CLI has no ticket client or task service, and the tool is disabled by default (`offPeakToolEnabled:false`). ⁴ `keepAwakeWhileRunning` exists only in the desktop settings schema; the desktop shows "ZCode keeps the machine awake while sessions run" on the idle-task screen. ⁵ Per the product's new-user offer; the quota is attached to the account, not the harness.
+¹ Official: [GLM-5.3-Flash Usage Campaign](https://docs.z.ai/devpack/notice/event-glm-5.3-flash) ("takes effect only in ZCode version 3.10 and later"). The ~1.5x / 0.67 entitlement text is an in-app notice that isn't in the published docs; check that it's still active before relying on it.
 
 ## Why?
 
