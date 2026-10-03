@@ -2,6 +2,14 @@
 
 Expose the **ZCode desktop harness** (Windows) through standard interfaces, so any client can drive the full agent — with the desktop app's machinery, and the desktop-only plan perks the CLI never gets:
 
+> ### ⚡ Entitlement rules: ~1.5x quota in ZCode
+>
+> When you use GLM through Coding Plan in ZCode, quota consumption is converted at a **0.67 coefficient** throughout the campaign period.
+>
+> In other words, the same model usage only deducts **67%** from quota. Effectively, your available quota during the campaign is about **1.5x** the original amount.
+>
+> *The conversion rules and end time of the quota benefit are subject to the official announcement.*
+
 ## GLM-5.3 and exclusive benefits
 
 With GLM-5.3's long context, ZCode can keep track of more files and longer stretches of development within a single task. It keeps moving forward by combining the current workspace, tool results, and Git changes, so even multi-step tasks don't need their background re-explained.
