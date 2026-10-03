@@ -2,13 +2,24 @@
 
 Expose the **ZCode desktop harness** (Windows) through standard interfaces, so any client can drive the full agent — with the desktop app's machinery, and the desktop-only plan perks the CLI never gets:
 
-> ### ⚡ Entitlement rules: ~1.5x quota in ZCode
+> ### ⚡ Quota benefits for GLM in ZCode (checked 2026-10-03)
 >
-> When you use GLM through Coding Plan in ZCode, quota consumption is converted at a **0.67 coefficient** throughout the campaign period.
+> **GLM-5.3-Flash is free in ZCode overnight until Oct 7, 2026.** From Sep 3 to Oct 7, 2026, 23:00–09:00 Singapore time (UTC+8), GLM-5.3-Flash used through **ZCode** (version 3.10+) or AutoClaw consumes **zero quota**. Other agents get **2x** quota in the same window. Paid plans only. If you hit your 5-hour or weekly limit, you can't use the campaign until the quota refreshes. GLM-5.3 (non-Flash) follows the normal rules. [Official notice](https://docs.z.ai/devpack/notice/event-glm-5.3-flash)
 >
-> In other words, the same model usage only deducts **67%** from quota. Effectively, your available quota during the campaign is about **1.5x** the original amount.
+> **The whole day is billed at off-peak rates until Oct 7, 2026.** From Sep 25 to Oct 7, 2026, usage at any hour is charged at the off-peak rate. [Plan update notice](https://docs.z.ai/devpack/notice/usage-revision)
 >
-> *The conversion rules and end time of the quota benefit are subject to the official announcement.*
+> **Standard consumption rates:**
+>
+> | Model | Off-peak | Peak (Mon–Fri 14:00–18:00 UTC+8) |
+> |---|---|---|
+> | GLM-5.3 | 1x | 3x |
+> | GLM-5.3-Flash | 0.4x | 1.2x |
+>
+> Weekends are billed at off-peak rates all day (existing subscriptions).
+>
+> **The ZCode entitlement campaign (~1.5x quota)** is shown as an in-app notice: *"When you use GLM through Coding Plan in ZCode, quota consumption is converted at a 0.67 coefficient throughout the campaign period… effectively about 1.5x the original amount. The conversion rules and end time … are subject to the official announcement."* It does not appear in Z.ai's published docs, and third-party write-ups give conflicting end dates (July 31 vs August 31), so check whether it's still active before relying on it.
+>
+> **Which clients count as "ZCode":** this bridge drives the ZCode **desktop** harness (installed: 3.14.4), which meets the 3.10+ requirement. The standalone ZCode CLI reports its own version (0.16.9). Whether the campaigns apply to it isn't documented.
 
 ## GLM-5.3 and exclusive benefits
 
