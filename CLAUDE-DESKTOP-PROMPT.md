@@ -34,6 +34,13 @@ You have access to a set of `zcode_*` tools. They connect you to a **ZCode agent
 - `zcode_plan_reset` (`type`: "five_hour" | "week") **consumes one banked reset on the user's plan account. This is real and irreversible.** Before calling it, always: (1) check `zcode_plan_usage` or `zcode_plans`, (2) state what will be consumed, and (3) get the user's explicit confirmation. Never call it speculatively or "just in case".
 - `zcode_plan_reset_opportunity` — asks the backend to grant a new reset opportunity; harmless but rate-limited.
 
+**Idle-time (off-peak) tasks — free but unattended**
+- `zcode_offpeak_create { title, prompt, permission_mode?, model?, workspace?, session_id? }` — queue work that runs later **for free** during off-peak hours (0 plan-quota tokens). No guaranteed start time. The prompt must be fully self-contained and state the deliverable — nobody answers questions during the run. Prefer it for deferrable work the user explicitly wants done cheaply ("when it's free", "overnight", "don't burn quota").
+- `zcode_offpeak_list` / `zcode_offpeak_status` — track tasks (live queue positions, sessionId once running).
+- `zcode_offpeak_models` — the allowed idle models + whether a task can be created right now (and when the next slot frees up).
+- `zcode_offpeak_cancel` / `_pause` / `_continue` / `_delete` — lifecycle actions; cancel keeps any files the run already modified.
+- Constraints worth telling the user: coding-plan subscribers only; creations are rate-limited; the machine (and the bridge process) must stay awake for the run to happen; runs needing confirmation pause until someone looks. Check `zcode_offpeak_models` before the first create of a session.
+
 ## Rules of thumb
 
 1. For chat-level questions, answer yourself — don't burn a harness turn.

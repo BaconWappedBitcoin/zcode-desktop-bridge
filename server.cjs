@@ -52,7 +52,7 @@ const cfg = loadConfig();
 const log = (...a) => console.log('[bridge]', new Date().toISOString(), ...a);
 const manager = new AgentManager(cfg, (...a) => log('[agent]', ...a));
 const { OffPeakManager, OffPeakApiError } = require('./lib/offpeak.cjs');
-const offPeak = new OffPeakManager({ manager, logger: (...a) => log('[offpeak]', ...a) });
+const offPeak = new OffPeakManager({ manager, dir: cfg.offpeakDir, logger: (...a) => log('[offpeak]', ...a) });
 offPeak.start();
 
 // conversation continuity: prevKey -> sessionId, sessionId -> fullKey
