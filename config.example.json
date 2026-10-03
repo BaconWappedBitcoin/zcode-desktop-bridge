@@ -1,0 +1,15 @@
+{
+  "port": 8787,
+  "bind": "127.0.0.1",
+  "apiKey": "",
+  "workspacePath": "bridge-workspace",
+  "mode": "yolo",
+  "exposeThinking": false,
+  "includeToolActivity": false,
+  "turnTimeoutMs": 900000,
+  "sessionIdleMs": 1800000,
+  "modelAliases": {
+    "claude-sonnet-4-5": { "providerId": "account:zai-individual-coding-plan", "modelId": "GLM-5.3-Flash", "reasoningLevel": "high" },
+    "claude-opus-4-6": { "providerId": "account:zai-individual-coding-plan", "modelId": "GLM-5.3", "reasoningLevel": "max" }
+  }
+}

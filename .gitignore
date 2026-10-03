@@ -1,0 +1,21 @@
+# local runtime state — never publish
+out/
+bridge-workspace/
+config.json
+
+# harness session artifacts in this workspace
+.zcode/
+.v2c/
+.video_agent/
+
+# logs / secrets
+*.log
+*.pid
+*.port
+
+# node
+node_modules/
+
+# editor / os
+.DS_Store
+Thumbs.db
