@@ -11,7 +11,15 @@
  *   zcode_session_send   run a follow-up turn on a session
  *   zcode_session_status inspect a session
  *   zcode_session_stop   stop a running turn
+ *   zcode_session_wait   block until the current (async) turn finishes
+ *   zcode_session_output peek at the latest streamed output, non-blocking
+ *   zcode_session_cancel cancel the running turn (session/stop interrupt)
+ *   zcode_sessions_list  every session in memory or on disk (recovery)
  *   zcode_models         list models available to the harness
+ *
+ * zcode_agent / zcode_session_start / zcode_session_send accept async:true to
+ * return {sessionId, turnId, status:"running"} immediately — long turns then
+ * never hit the client's tool timeout; poll with zcode_session_wait.
  *
  * Long turns emit MCP progress notifications with the latest output snippet.
  * stdout is the MCP wire (newline-delimited JSON-RPC 2.0); logs go to stderr.
@@ -77,32 +85,69 @@ const TOOLS = [
         workspace: { type: 'string', description: 'Optional absolute directory the agent works in (default: the bridge workspace).' },
         reasoning_level: { type: 'string', enum: ['low', 'high', 'max'], description: 'Reasoning effort (default high).' },
         model: { type: 'string', description: 'Optional model override for this call only, e.g. "GLM-5.3" (see zcode_models).' },
+        async: { type: 'boolean', description: 'Return immediately with {sessionId, turnId, status:"running"} instead of waiting for the turn. Then poll zcode_session_wait / zcode_session_output, or zcode_session_cancel.' },
       },
       required: ['prompt'],
     },
   },
   {
     name: 'zcode_session_start',
-    description: 'Create a persistent ZCode harness session (optionally with an opening prompt) for multi-turn orchestration. Returns the sessionId.',
+    description: 'Create a persistent ZCode harness session (optionally with an opening prompt) for multi-turn orchestration. Returns the sessionId. With async:true and an initial_prompt it returns {sessionId, turnId, status:"running"} immediately.',
     inputSchema: {
       type: 'object',
       properties: {
         initial_prompt: { type: 'string', description: 'Optional first prompt; if omitted the session starts idle.' },
         workspace: { type: 'string' },
+        async: { type: 'boolean', description: 'Start the opening prompt without waiting; poll with zcode_session_wait.' },
       },
     },
   },
   {
     name: 'zcode_session_send',
-    description: 'Send a follow-up prompt to a session created by zcode_session_start and wait for the turn to finish. Emits progress notifications with the latest output.',
+    description: 'Send a follow-up prompt to a session created by zcode_session_start and wait for the turn to finish. Emits progress notifications with the latest output. With async:true returns {sessionId, turnId, status:"running"} immediately.',
     inputSchema: {
       type: 'object',
       properties: {
         session_id: { type: 'string' },
         prompt: { type: 'string' },
+        async: { type: 'boolean', description: 'Start the turn without waiting; poll with zcode_session_wait.' },
       },
       required: ['session_id', 'prompt'],
     },
+  },
+  {
+    name: 'zcode_session_wait',
+    description: 'Wait for the current turn on a session to finish (use after an async zcode_agent / zcode_session_start / zcode_session_send). Blocks up to timeout_s; returns {status: running|done|error|cancelled (idle if no turn ever ran), finalText when done, lastOutput, usage, model}. Call repeatedly until status is no longer "running".',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string' },
+        timeout_s: { type: 'number', description: 'Maximum seconds to block (default 60, max 600).' },
+      },
+      required: ['session_id'],
+    },
+  },
+  {
+    name: 'zcode_session_output',
+    description: 'Peek at a session\'s latest streamed text/progress without blocking (for async turns). Returns {sessionId, status, turnId, tail}.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string' },
+        tail_chars: { type: 'number', description: 'Length of the output tail to return (default 2000, capped at 2000).' },
+      },
+      required: ['session_id'],
+    },
+  },
+  {
+    name: 'zcode_session_cancel',
+    description: 'Cancel the running turn on a session: interrupts via the harness protocol\'s session/stop (the session stays usable for the next prompt) and records status "cancelled". Harmless if no turn is running.',
+    inputSchema: { type: 'object', properties: { session_id: { type: 'string' } }, required: ['session_id'] },
+  },
+  {
+    name: 'zcode_sessions_list',
+    description: 'List every session this bridge process knows plus every session recorded on disk (the statusDir files), with id, workspace, model, status (idle|running|done|error|cancelled), turns, createdAt, lastActivity, pid — the recovery path for a sessionId lost to a client tool timeout.',
+    inputSchema: { type: 'object', properties: {} },
   },
   {
     name: 'zcode_session_status',
@@ -192,6 +237,11 @@ async function handleToolCall(params) {
       reasoningLevel: args.reasoning_level,
       ...(modelSel ? { model: modelSel } : {}),
     });
+    if (args.async === true) {
+      const started = mgr().startTurn(sessionId, String(args.prompt || ''), {});
+      const text = `sessionId: ${sessionId}\nturnId: ${started.turnId}\nstatus: running\n\nPoll with zcode_session_wait { "session_id": "${sessionId}" }, peek with zcode_session_output, cancel with zcode_session_cancel.`;
+      return toolResult(text, { structuredContent: { sessionId, turnId: started.turnId, status: 'running', model } });
+    }
     try {
       const result = await mgr().runTurn(sessionId, String(args.prompt || ''), {
         onDelta: (d) => { if (d.type === 'text') progress(token, d.text.slice(-300)); },
@@ -210,6 +260,10 @@ async function handleToolCall(params) {
   if (name === 'zcode_session_start') {
     const created = await mgr().createSession({ workspacePath: args.workspace });
     if (args.initial_prompt) {
+      if (args.async === true) {
+        const started = mgr().startTurn(created.sessionId, String(args.initial_prompt), {});
+        return toolResult(`sessionId: ${created.sessionId}\nturnId: ${started.turnId}\nstatus: running`, { structuredContent: { sessionId: created.sessionId, turnId: started.turnId, status: 'running', model: created.model } });
+      }
       progress(token, 'running opening prompt…');
       const result = await mgr().runTurn(created.sessionId, String(args.initial_prompt), {
         onDelta: (d) => { if (d.type === 'text') progress(token, d.text.slice(-300)); },
@@ -221,11 +275,46 @@ async function handleToolCall(params) {
 
   if (name === 'zcode_session_send') {
     const info = mgr().sessionInfo(String(args.session_id || ''));
-    if (!info) return toolError(`unknown session ${args.session_id} (start one with zcode_session_start)`);
+    if (!info) return toolError(`unknown session ${args.session_id} (start one with zcode_session_start, or recover it with zcode_sessions_list)`);
+    if (args.async === true) {
+      const started = mgr().startTurn(String(args.session_id), String(args.prompt || ''), {});
+      return toolResult(`sessionId: ${args.session_id}\nturnId: ${started.turnId}\nstatus: running`, { structuredContent: started });
+    }
     const result = await mgr().runTurn(String(args.session_id), String(args.prompt || ''), {
       onDelta: (d) => { if (d.type === 'text') progress(token, d.text.slice(-300)); },
     });
     return toolResult(result.text || '(no textual output)', { structuredContent: { text: result.text, usage: result.usage, finishReason: result.finishReason } });
+  }
+
+  if (name === 'zcode_session_wait') {
+    const sid = String(args.session_id || '');
+    if (!mgr().sessionInfo(sid)) return toolError(`unknown session ${sid} (recover it with zcode_sessions_list)`);
+    let timeoutS = Number(args.timeout_s);
+    if (!Number.isFinite(timeoutS)) timeoutS = 60;
+    timeoutS = Math.max(0, Math.min(timeoutS, 600));
+    const view = await mgr().waitTurn(sid, timeoutS * 1000);
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+
+  if (name === 'zcode_session_output') {
+    const sid = String(args.session_id || '');
+    let tailChars = Number(args.tail_chars);
+    if (!Number.isFinite(tailChars) || tailChars < 0) tailChars = 2000;
+    tailChars = Math.min(tailChars, 2000);
+    let out;
+    try { out = mgr().sessionOutput(sid); } catch (e) { return toolError(e.message); }
+    const view = { sessionId: out.sessionId, status: out.status, turnId: out.turnId, tail: String(out.tail).slice(-tailChars) };
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+
+  if (name === 'zcode_session_cancel') {
+    const result = await mgr().cancelTurn(String(args.session_id || ''));
+    return toolResult(JSON.stringify(result, null, 2), { structuredContent: result });
+  }
+
+  if (name === 'zcode_sessions_list') {
+    const sessions = mgr().sessionsList();
+    return toolResult(JSON.stringify({ statusDir: mgr().statusDir, sessions }, null, 2), { structuredContent: { statusDir: mgr().statusDir, sessions } });
   }
 
   if (name === 'zcode_session_status') {
@@ -325,7 +414,7 @@ async function dispatch(msg) {
     return reply(msg.id, {
       protocolVersion,
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'zcode-bridge', version: '0.1.0', title: 'ZCode harness bridge' },
+      serverInfo: { name: 'zcode-bridge', version: '0.2.0', title: 'ZCode harness bridge' },
     });
   }
   if (msg.method === 'ping') return reply(msg.id, {});
