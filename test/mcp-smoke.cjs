@@ -129,7 +129,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     && Array.isArray(olc.tasks);
   console.log(offpeakOk ? 'OFFPEAK (read-only) OK' : 'OFFPEAK (read-only) FAIL');
 
-  const ok = /MCP_SMOKE_OK/.test(String(text)) && planOk && switchOk && plansOk && asyncOk && offpeakOk;
+  // offers live section — READ-ONLY detection (the bridge never claims):
+  // live-refresh list + the never-claim note.
+  const of = await call('tools/call', { name: 'zcode_offers', arguments: { refresh: true } });
+  const ofc = (of.result && of.result.structuredContent) || {};
+  console.log('offers =>', (ofc.offers || []).length, 'offer(s); lastCheckAt:', ofc.lastCheckAt, '| lastError:', ofc.lastError || 'none');
+  console.log('offers note =>', String(ofc.note || '').slice(0, 120));
+  const offersOk = !of.result.isError && Array.isArray(ofc.offers) && !!ofc.lastCheckAt
+    && (ofc.offers.length === 0 || ofc.offers.every((o) => o.id && (o.kind === 'daily' || o.kind === 'oneTime' || o.kind === 'reset-opportunity')))
+    && /never claims/.test(String(ofc.note || ''));
+  console.log(offersOk ? 'OFFERS (read-only) OK' : 'OFFERS (read-only) FAIL');
+
+  const ok = /MCP_SMOKE_OK/.test(String(text)) && planOk && switchOk && plansOk && asyncOk && offpeakOk && offersOk;
   console.log(ok ? 'SMOKE PASS' : 'SMOKE FAIL');
   child.kill();
   process.exit(ok ? 0 : 1);

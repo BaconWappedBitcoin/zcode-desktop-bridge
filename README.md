@@ -158,6 +158,7 @@ A ready-made system prompt for Claude lives in [`CLAUDE-DESKTOP-PROMPT.md`](CLAU
 | `zcode_offpeak_list` / `zcode_offpeak_status` | list tasks with live queue positions / inspect one |
 | `zcode_offpeak_models` | idle-time allowed models + live eligibility (next-allowed time when throttled) |
 | `zcode_offpeak_cancel` / `_pause` / `_continue` / `_delete` | task lifecycle actions |
+| `zcode_offers` | claimable plan offers + banked reset opportunities (detect-only, **never claims**; see "Offer notifications") |
 
 ## Async turns (never lose a session to a tool timeout)
 
@@ -230,6 +231,31 @@ Schema of `<offPeakTaskId>.json` (timestamps epoch ms):
 | `lastError` | last failure message, else `null` |
 | `settled` | ticket settled with the server |
 
+## Offer notifications (detect-only)
+
+The desktop occasionally pops up **limited-time claimable plan offers** ("manualClaimPlan": a daily or one-time token bonus you click *Claim* on). The bridge **detects these and notifies you — it never claims them**.
+
+> **The never-claim rule.** Claiming an offer (`POST /api/v1/zcode-plan/billing/claim`) requires a human-solved Aliyun captcha (header `X-Aliyun-Captcha-Verify-Param`). The bridge never calls the claim endpoint, never automates the captcha, and never scripts clicks on the app's Claim button. Detection and notification only — you claim manually in the ZCode app. A static test enforces that no bridge code path references the claim endpoint or captcha headers.
+
+How it works (verified against desktop 3.14.4 `out/host/index.js` + one live read-only probe):
+
+- **List**: `GET zcode.z.ai/api/v1/zcode-plan/billing/preview?app_version&platform` with the zcode JWT **plus a `X-Device-Mid` header — without it the server answers `400 code 3001 "parameter error"`**. Response `data.plans[]`: `plan_id`, `name`, `description`, `entitlements[]` (`grant_units` token amount, `period`, `meter`, `effective_at`). The server lists only what this account may still claim — claimed/exhausted offers simply drop out.
+- **Valid-until**: the marketing campaign engine `GET /api/v1/marketing/touch?seq&locale` (same headers) delivers the banner/popup, and its hero `args.zcode_plan` carries `ends_at` — the only source of expiry times, which powers the "about to expire" reminder.
+- **Reset opportunities**: the passive signal from `GET /api/v1/coding-plan/reset/status` (banked 5-hour/week resets with `expire_at`) is surfaced as `kind:"reset-opportunity"` entries — notify only, never consumed (spending stays `zcode_plan_reset`).
+
+Behavior:
+
+- A poller (config `offersPollMs`, default 10 min; `0` disables) checks all three read-only endpoints. State lives in `out/offers/state.json` (atomic writes); every **new claimable offer** and every offer **about to expire (< 30 min left, once)** appends an NDJSON line to `out/offers/events.log`.
+- On a new offer (and once more for expiry) it raises a **Windows toast** built with PowerShell's WinRT `Windows.UI.Notifications` — no module installs. Title "ZCode offer available", body = offer title + tokens + valid-until. Clicking the toast launches the `zcode://` deep link, which opens/focuses the ZCode app (the desktop registers that protocol). Config `offerToasts` (default `true`) turns toasts off.
+- **Two processes, one toaster**: both `server.cjs` and `mcp-server.cjs` start the poller; `out/offers/poller.pid` is a **first-alive-wins** lock — the first bridge process to grab it polls and toasts, later processes run dormant (their explicit refreshes stay read-only so they can neither double-toast nor mark an offer toasted before the owner notifies it). A stale pid (crashed owner) is taken over on the next start.
+- Ask any time: `zcode_offers { refresh? }` (MCP) or `GET /v1/offers` (`?refresh=1` for a live check) returns the current list + last check time. Every response carries the never-claim note.
+
+```json
+{ "id": "start-plan-trial", "title": "Flash daily bonus", "kind": "daily",
+  "tokens": { "amount": 50000, "unit": "tokens" }, "startsAt": null,
+  "endsAt": "2026-10-04T12:00:00.000Z", "claimable": true, "claimed": false }
+```
+
 ## On-disk session status
 
 Every session is mirrored to `statusDir` (config, default `<repo>/out/sessions/`) so external watchers — bash scripts, another terminal — can follow turns without talking to the bridge:
@@ -283,6 +309,9 @@ Copy `config.example.json` → `config.json`:
 | `turnTimeoutMs` / `sessionIdleMs` | `900000` / `1800000` | turn cap; idle-session reaping |
 | `statusDir` | `<repo>/out/sessions/` | on-disk session status files (see "On-disk session status") |
 | `offpeakDir` | `<repo>/out/offpeak/` | on-disk idle-time task files (see "On-disk idle-time task status") |
+| `offersPollMs` | `600000` | offer-detector poll interval; `0` disables polling (see "Offer notifications") |
+| `offerToasts` | `true` | raise a Windows toast on new claimable offers |
+| `offersDir` | `<repo>/out/offers/` | offer detector state (`state.json`, `events.log`, `poller.pid`) |
 
 Env overrides: `ZCODE_EXE`, `ZCODE_BUNDLE`, `ZCODE_DIR`, `ZCODE_HOME`, `ZCODE_BUILTIN_FILE`, `ZCODE_CREDENTIAL_SECRET`, `ZCODE_PLAN_ORIGIN`, `ZCODE_QUOTA_ORIGIN`.
 
@@ -295,6 +324,7 @@ Verified against ZCode desktop 3.14.4 / agent 0.16.9 (see `proto-probe.cjs`, the
 - Model calls trigger a server→client `interaction/requestProviderRuntimeHeaders` request; the bridge answers with the coding-plan API key decrypted from `~/.zcode/v2/credentials.json` (`enc:v1:` = AES-256-GCM with a machine-derivable secret — the same scheme the CLI uses). Keys never leave the process except to the app-server over its private stdio pipe, and are never logged.
 - Plan quota/resets use the desktop's own backend calls: `GET api.z.ai/api/monitor/usage/quota/limit` (plan API key; unit 3 = 5-hour window, unit 6 = weekly) and `zcode.z.ai/api/v1/coding-plan/reset/{status,use,opportunity}` (zcode JWT + MaaS token headers; `reset_type` is `"FIVE_HOUR" | "WEEK"`, idempotency keys must be UUIDs).
 - Idle-time tasks: the app-server has no offPeak RPCs — `offPeak/create`/`offPeak/list` are server→client requests the *host* answers (the desktop from its task service, the bridge from `lib/offpeak.cjs`). Tickets: `zcode.z.ai/api/v1/off-peak/ticket{,/status,/<id>/settle}` + `GET …/ticket/availability` (all live-verified). A ready ticket's run carries `modelExecution.requestAuth` with `X-Off-Peak-Ticket-ID` (plus JWT + plan API key) — that's what makes it free.
+- Offer detection mirrors the desktop's own calls (all read-only, live-verified): `GET zcode.z.ai/api/v1/zcode-plan/billing/preview` (claimable plan list; needs the `X-Device-Mid` header), `GET /api/v1/marketing/touch` (banner/popup campaign deliveries with `ends_at`), and the reset/status read above. The claim endpoint is deliberately **not** implemented anywhere in the bridge (a static test enforces that).
 
 ## Security notes
 
@@ -309,22 +339,24 @@ bash test/e2e.sh          # facade: health, stream/non-stream, continuity, valid
 node test/mcp-smoke.cjs   # MCP: handshake, agent turn, model switch cycle, plans, quota, async flow
 node test/async-flow.cjs  # async turns, status files, sessions_list, timeout, cancel (32 checks, mocked protocol — no harness needed)
 node test/offpeak.cjs     # idle-time tasks: create/refresh/dispatch/requeue/pause/cancel + host RPCs (46 checks, mocked ticket API — no network)
+node test/offers.cjs      # offer detection: normalize/dedup/expiry/pid-lock + static no-claim-endpoint guard (35 checks, no network)
 ```
 
 ## Project layout
 
 ```
-server.cjs                Anthropic Messages facade (HTTP/SSE) + /v1/offpeak
-mcp-server.cjs            MCP stdio front-end (24 tools)
+server.cjs                Anthropic Messages facade (HTTP/SSE) + /v1/offpeak + /v1/offers
+mcp-server.cjs            MCP stdio front-end (25 tools)
 lib/harness-env.cjs       install discovery, config reads, credential decryption
 lib/zcode-protocol.cjs    ZCode Protocol client + desktop-host request responders
 lib/agent-manager.cjs     sessions, turns, streaming, history import, model/plan switching
 lib/session-status.cjs    on-disk session status (atomic <id>.json + <id>.log NDJSON)
 lib/coding-plan.cjs       plan quota windows + banked resets (Z.ai backend)
 lib/offpeak.cjs           idle-time task host: ticket API, store, poller, run dispatch
+lib/offers.cjs            offer detector: preview/marketing/reset reads, poller, toasts (never claims)
 run-bridge.cmd            launcher on the harness's embedded Node
 CLAUDE-DESKTOP-PROMPT.md  ready-made system prompt for Claude clients
-test/                     e2e + MCP smoke + offpeak suites
+test/                     e2e + MCP smoke + offpeak + offers suites
 proto-probe.cjs           protocol exploration harness (dev tool)
 ```
 
