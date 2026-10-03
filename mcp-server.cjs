@@ -54,7 +54,7 @@ function loadConfig() {
   if (cfgPath && fs.existsSync(cfgPath)) {
     try { fileCfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8')); } catch { /* ignore */ }
   }
-  return Object.assign({ workspacePath: path.join(__dirname, 'bridge-workspace'), mode: 'yolo', turnTimeoutMs: 15 * 60 * 1000 }, fileCfg);
+  return Object.assign({ workspacePath: path.join(__dirname, 'bridge-workspace'), mode: 'yolo', turnTimeoutMs: 15 * 60 * 1000, asyncTurnTimeoutMs: 6 * 60 * 60 * 1000 }, fileCfg);
 }
 
 const cfg = loadConfig();

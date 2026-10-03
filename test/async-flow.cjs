@@ -108,6 +108,7 @@ function makeManager(cfg = {}) {
     statusDir,
     model: { providerId: 'fake:provider', modelId: 'Fake-Model', options: { reasoningLevel: 'high' } },
     turnTimeoutMs: cfg.turnTimeoutMs || 60000,
+    asyncTurnTimeoutMs: cfg.asyncTurnTimeoutMs,
   }, () => {});
   const fake = new FakeClient();
   // Bridge the fake's notifications into the manager's handler pump the way
@@ -208,6 +209,44 @@ function makeManager(cfg = {}) {
   check('timeout error message contains sessionId', !!timedOut && timedOut.message.includes(c7.sessionId), timedOut && timedOut.message);
   const d7 = JSON.parse(fs.readFileSync(path.join(m7.statusDir, `${c7.sessionId}.json`), 'utf8'));
   check('disk records the timeout as error', d7.status === 'error' && /did not finish/.test(d7.error || ''), JSON.stringify(d7).slice(0, 200));
+
+  console.log('== 7b. async turn outlives the wait deadline: detached, then done ==');
+  {
+    // asyncTurnTimeoutMs (700ms) is deliberately shorter than turnTimeoutMs
+    // (60s) to prove the async cap is the one governing detached turns.
+    const m7b = makeManager({ turnTimeoutMs: 60000, asyncTurnTimeoutMs: 700 });
+    const c7b = await m7b.mgr.createSession({});
+    m7b.mgr.startTurn(c7b.sessionId, 'long async task');
+    await sleep(1400); // past the 700 ms async wait deadline
+    const w7b = await m7b.mgr.waitTurn(c7b.sessionId, 300);
+    check('detached turn still reports running (never error)', w7b.status === 'running', JSON.stringify(w7b));
+    check('wait view carries detached + waitDeadlineHitAt', w7b.detached === true && typeof w7b.waitDeadlineHitAt === 'number', JSON.stringify(w7b));
+    const d7b = JSON.parse(fs.readFileSync(path.join(m7b.statusDir, `${c7b.sessionId}.json`), 'utf8'));
+    check('disk keeps running + detached + waitDeadlineHitAt, no error', d7b.status === 'running'
+      && d7b.detached === true && typeof d7b.waitDeadlineHitAt === 'number' && d7b.error === null, JSON.stringify(d7b).slice(0, 260));
+    const log7b = fs.readFileSync(path.join(m7b.statusDir, `${c7b.sessionId}.log`), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    check('log records the turn-detached event', log7b.some((l) => l.event === 'turn-detached'), log7b.map((l) => l.event).join(','));
+    m7b.fake.streamText('finally finished the long task');
+    m7b.fake.finish();
+    const done7b = await m7b.mgr.waitTurn(c7b.sessionId, 10000);
+    check('turn later flips to done with finalText', done7b.status === 'done' && /finally finished/.test(done7b.finalText || ''), JSON.stringify(done7b).slice(0, 260));
+    const d7b2 = JSON.parse(fs.readFileSync(path.join(m7b.statusDir, `${c7b.sessionId}.json`), 'utf8'));
+    check('disk reaches done with finalText after detach (detached kept)', d7b2.status === 'done'
+      && /finally finished/.test(d7b2.finalTextTail || '') && d7b2.detached === true, JSON.stringify(d7b2).slice(0, 260));
+  }
+
+  console.log('== 7c. cancelled detached turn reaches cancelled, not error ==');
+  {
+    const m7c = makeManager({ asyncTurnTimeoutMs: 500 });
+    const c7c = await m7c.mgr.createSession({});
+    m7c.mgr.startTurn(c7c.sessionId, 'long task, cancelled after detach');
+    await sleep(1000); // detach at ~500ms
+    await m7c.mgr.cancelTurn(c7c.sessionId);
+    const w7c = await m7c.mgr.waitTurn(c7c.sessionId, 10000);
+    check('cancelled detached turn reports cancelled', w7c.status === 'cancelled', JSON.stringify(w7c));
+    const d7c = JSON.parse(fs.readFileSync(path.join(m7c.statusDir, `${c7c.sessionId}.json`), 'utf8'));
+    check('disk records cancelled after detach', d7c.status === 'cancelled' && d7c.detached === true, JSON.stringify(d7c).slice(0, 240));
+  }
 
   console.log('== 8. cancel: interrupt confirmed by the harness ==');
   const m8 = makeManager();

@@ -47,6 +47,7 @@ function loadConfig() {
     exposeThinking: false,
     includeToolActivity: false,
     turnTimeoutMs: 15 * 60 * 1000,
+    asyncTurnTimeoutMs: 6 * 60 * 60 * 1000,
     maxConcurrentSessions: 8,
     sessionIdleMs: 30 * 60 * 1000,
     modelAliases: {},
