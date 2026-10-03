@@ -9,6 +9,7 @@
  *   POST /v1/messages/count_tokens
  *   GET  /v1/offpeak              list idle-time tasks (live refresh)
  *   POST /v1/offpeak              queue an idle-time task {title, prompt, ...}
+ *   GET  /v1/offers               claimable plan offers (detect-only, never claims)
  *   GET  /healthz
  *
  * Run with system Node, or without any Node install via:
@@ -54,6 +55,19 @@ const manager = new AgentManager(cfg, (...a) => log('[agent]', ...a));
 const { OffPeakManager, OffPeakApiError } = require('./lib/offpeak.cjs');
 const offPeak = new OffPeakManager({ manager, dir: cfg.offpeakDir, logger: (...a) => log('[offpeak]', ...a) });
 offPeak.start();
+
+// Offer detector: polls + toasts (config offersPollMs / offerToasts).
+// Detection only — NEVER claims (claiming needs the in-app Aliyun captcha).
+// The out/offers/poller.pid lock (first-alive-wins) prevents this process and
+// the MCP server from double-toasting when both run.
+const { OffersManager } = require('./lib/offers.cjs');
+const offers = new OffersManager({
+  dir: cfg.offersDir,
+  pollMs: cfg.offersPollMs,
+  toasts: cfg.offerToasts !== false,
+  logger: (...a) => log('[offers]', ...a),
+});
+offers.start();
 
 // conversation continuity: prevKey -> sessionId, sessionId -> fullKey
 const convCache = new Map();
@@ -275,6 +289,19 @@ async function handleOffpeakCreate(req, res) {
 
 function iso(epoch) { return epoch ? new Date(epoch).toISOString() : null; }
 
+// ------------------------------------------------------------------ offers
+/** GET /v1/offers — claimable plan offers (cached; ?refresh=1 for a live check). */
+async function handleOffers(req, res) {
+  try {
+    const refresh = /[?&]refresh=1\b/.test(req.url || '');
+    const result = await offers.list({ refresh });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(result));
+  } catch (e) {
+    facade.anthropicError(res, 502, 'api_error', e.message);
+  }
+}
+
 // ---------------------------------------------------------------- server
 const server = http.createServer(async (req, res) => {
   const url = (req.url || '').split('?')[0];
@@ -290,6 +317,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (url === '/v1/models' || url === '/v1/models/')) return await handleModels(req, res);
     if (req.method === 'GET' && (url === '/v1/offpeak' || url === '/v1/offpeak/')) return await handleOffpeakList(req, res);
     if (req.method === 'POST' && (url === '/v1/offpeak' || url === '/v1/offpeak/')) return await handleOffpeakCreate(req, res);
+    if (req.method === 'GET' && (url === '/v1/offers' || url === '/v1/offers/')) return await handleOffers(req, res);
     if (req.method === 'POST' && url === '/v1/messages/count_tokens') {
       const raw = await readBody(req).catch(() => Buffer.alloc(0));
       let n = 0;
@@ -305,7 +333,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && (url === '/' || url === '')) {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ service: 'zcode-anthropic-bridge', endpoints: ['/v1/messages', '/v1/models', '/v1/messages/count_tokens', '/v1/offpeak', '/healthz'] }));
+      res.end(JSON.stringify({ service: 'zcode-anthropic-bridge', endpoints: ['/v1/messages', '/v1/models', '/v1/messages/count_tokens', '/v1/offpeak', '/v1/offers', '/healthz'] }));
       return;
     }
     facade.anthropicError(res, 404, 'not_found_error', `no such endpoint: ${req.method} ${url}`);
@@ -327,6 +355,7 @@ async function shutdown() {
   log('shutting down…');
   server.close();
   offPeak.stop();
+  offers.stop();
   await manager.shutdown().catch(() => {});
   process.exit(0);
 }

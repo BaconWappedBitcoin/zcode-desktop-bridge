@@ -24,6 +24,7 @@
  *   zcode_offpeak_pause  pause a queued idle-time task
  *   zcode_offpeak_continue resume a paused idle-time task
  *   zcode_offpeak_delete remove an idle-time task record
+ *   zcode_offers         claimable plan offers (detection only — never claims)
  *
  * zcode_agent / zcode_session_start / zcode_session_send accept async:true to
  * return {sessionId, turnId, status:"running"} immediately — long turns then
@@ -73,6 +74,19 @@ function off() {
   }
   return offPeak;
 }
+
+// Offer detector: polls for claimable plan offers and toasts (config
+// offersPollMs, 0 disables; offerToasts, default on). Detection only — the
+// bridge NEVER claims offers (claiming needs the in-app Aliyun captcha).
+// The out/offers/poller.pid lock (first-alive-wins) keeps this process and
+// server.cjs from double-toasting when both run.
+const offers = new (require('./lib/offers.cjs').OffersManager)({
+  dir: cfg.offersDir,
+  pollMs: cfg.offersPollMs,
+  toasts: cfg.offerToasts !== false,
+  logger: (m, x) => log('[offers]', m, x || ''),
+});
+offers.start();
 
 // ------------------------------------------------------------------ wire
 function write(msg) { process.stdout.write(JSON.stringify(msg) + '\n'); }
@@ -290,6 +304,16 @@ const TOOLS = [
     name: 'zcode_offpeak_delete',
     description: 'Delete an idle-time task record (cancels first when still queued/running; the on-disk status file is removed). Irreversible.',
     inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
+    name: 'zcode_offers',
+    description: 'List claimable ZCode plan offers (limited-time daily/one-time token offers the desktop app would pop up), plus banked reset opportunities, with title, token amount, period and valid-until. The bridge DETECTS and notifies only — it never claims an offer (claiming requires the in-app Aliyun captcha); claim manually in the ZCode app.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        refresh: { type: 'boolean', description: 'Run a live read-only check before answering (default false: return the poller\'s cached list and last check time).' },
+      },
+    },
   },
 ];
 
@@ -518,6 +542,11 @@ async function handleToolCall(params) {
     return toolResult(JSON.stringify(result, null, 2), { structuredContent: result });
   }
 
+  if (name === 'zcode_offers') {
+    const result = await offers.list({ refresh: args.refresh === true });
+    return toolResult(JSON.stringify(result, null, 2), { structuredContent: result });
+  }
+
   return toolError(`unknown tool: ${name}`);
 }
 
@@ -549,7 +578,7 @@ async function dispatch(msg) {
     return reply(msg.id, {
       protocolVersion,
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'zcode-bridge', version: '0.3.0', title: 'ZCode harness bridge' },
+      serverInfo: { name: 'zcode-bridge', version: '0.4.0', title: 'ZCode harness bridge' },
     });
   }
   if (msg.method === 'ping') return reply(msg.id, {});
@@ -571,6 +600,7 @@ async function dispatch(msg) {
 }
 
 async function shutdown() {
+  offers.stop();
   if (manager) await manager.shutdown().catch(() => {});
   process.exit(0);
 }
