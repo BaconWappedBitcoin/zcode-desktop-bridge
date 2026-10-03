@@ -63,6 +63,7 @@ function loadConfig(argv, root = rootDir(argv)) {
     offersDir: fileCfg.offersDir || path.join(root, 'out', 'offers'),
     uiDir: fileCfg.uiDir || path.join(root, 'out', 'ui'),
     uiWatch: [],
+    uiTailIgnore: Array.isArray(fileCfg.uiTailIgnore) ? fileCfg.uiTailIgnore : undefined,
   };
   pushWatch(cfg, fileCfg.uiWatch);
   const envWatch = process.env.UI_WATCH || process.env.BRIDGE_UI_WATCH;
@@ -457,6 +458,7 @@ async function main() {
       offersDir: cfg.offersDir,
       uiDir: cfg.uiDir,
       watchDirs: cfg.uiWatch,
+      tailIgnore: cfg.uiTailIgnore,
       historyMode: view.historyMode,
       httpUp,
     });

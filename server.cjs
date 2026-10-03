@@ -56,6 +56,7 @@ function loadConfig() {
     offersDir: path.join(__dirname, 'out', 'offers'),
     uiDir: path.join(__dirname, 'out', 'ui'),
     uiWatch: [],
+    uiTailIgnore: undefined, // lib/ui-state.cjs default applies when unset
   }, fileCfg);
   if (process.env.PORT) cfg.port = Number(process.env.PORT);
   if (process.env.BIND) cfg.bind = process.env.BIND;
@@ -348,6 +349,7 @@ function handleUiState(req, res) {
     offersDir: cfg.offersDir,
     uiDir: cfg.uiDir,
     watchDirs: cfg.uiWatch,
+    tailIgnore: cfg.uiTailIgnore,
     historyMode: /[?&]history=days\b/.test(req.url || '') ? 'days' : 'hours',
     httpUp: true,
   });

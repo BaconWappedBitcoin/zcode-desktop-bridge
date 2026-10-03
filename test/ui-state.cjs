@@ -117,7 +117,7 @@ const deadPid = () => new Promise((resolve) => {
   const sessRow = state1.active.find((r) => r.id === 'sess_aaa');
   check('session row: kind/model/status', sessRow.kind === 'session' && sessRow.model === 'GLM-5.3-Flash' && sessRow.status === 'running');
   check('session row: elapsed from startedAt to now', Math.abs(sessRow.elapsedMs - 40 * 60000) < 1000, sessRow.elapsedMs);
-  check('session row: tail collapsed to one line', sessRow.tail === 'step 3 of 9: writing tests second line', sessRow.tail);
+  check('session row: tail = last meaningful line', sessRow.tail === 'second line', sessRow.tail);
   check('session row: usage carried', sessRow.usage && sessRow.usage.output === 340);
   const doneRow = state1.active.find((r) => r.id === 'sess_bbb');
   check('done session not cancelable', doneRow.cancelable === false);
@@ -317,6 +317,46 @@ const deadPid = () => new Promise((resolve) => {
     check('BRIDGE_UI_COLOR=off -> none', detectColorDepth({ BRIDGE_UI_COLOR: 'off' }) === 'none');
     check('WT_SESSION -> truecolor', detectColorDepth({ WT_SESSION: 'abc' }) === 'tc');
     check('bare conhost (no env) -> 16-color fallback', detectColorDepth({}) === '16');
+  }
+
+  console.log('== 15. uiTailIgnore: chatter lines skipped in tails ==');
+  {
+    const root15 = tmp('tailnoise');
+    const sDir15 = path.join(root15, 'out', 'sessions');
+    const laneDir15 = path.join(root15, 'lanes');
+    write(path.join(sDir15, 'sess_noise.json'), JSON.stringify({
+      id: 'sess_noise', status: 'running', turns: 1, createdAt: NOW - 60000, startedAt: NOW - 60000,
+      lastActivity: NOW - 30000,
+      lastOutputTail: 'useful summary line\nZCode Built-in skipped (not-due)\nZCode Built-in skipped (not-due)',
+      pid: dead,
+    }));
+    write(path.join(laneDir15, 'build.pid'), `${dead}\n`);
+    write(path.join(laneDir15, 'build.done'), `exit=0 at ${iso(NOW - H)}`);
+    write(path.join(laneDir15, 'build.log'), '[09:00] compiling\n[09:01] 42 files ok\nZCode Built-in skipped (not-due)\nZCode Built-in skipped (not-due)\n');
+    write(path.join(laneDir15, 'allnoise.pid'), `${dead}\n`);
+    write(path.join(laneDir15, 'allnoise.log'), 'ZCode Built-in skipped (not-due)\nZCode Built-in skipped (not-due)\n');
+    const agg = (tailIgnore) => ui.aggregate({
+      rootDir: root15, sessionsDir: sDir15,
+      offpeakDir: path.join(root15, 'out', 'offpeak'), offersDir: path.join(root15, 'out', 'offers'),
+      uiDir: path.join(root15, 'out', 'ui'), watchDirs: [{ name: 'game', dir: laneDir15 }], now: NOW, tailIgnore,
+    });
+    const st15 = agg(undefined);
+    check('default filter: session tail = last line that is not chatter', st15.active.find((r) => r.id === 'sess_noise').tail === 'useful summary line',
+      st15.active.find((r) => r.id === 'sess_noise').tail);
+    check('default filter: lane tail skips trailing chatter', st15.active.find((r) => r.id === 'game:build').tail === '[09:01] 42 files ok',
+      st15.active.find((r) => r.id === 'game:build').tail);
+    check('all-noise lane tail empties', st15.active.find((r) => r.id === 'game:allnoise').tail === '',
+      st15.active.find((r) => r.id === 'game:allnoise').tail);
+    const stCustom = agg(['^IGNORE_ME$']);
+    check('custom list replaces the default (chatter line shows)', stCustom.active.find((r) => r.id === 'game:build').tail === 'ZCode Built-in skipped (not-due)',
+      stCustom.active.find((r) => r.id === 'game:build').tail);
+    const stEmpty = agg([]);
+    check('empty list disables filtering', stEmpty.active.find((r) => r.id === 'game:build').tail === 'ZCode Built-in skipped (not-due)');
+    const stBad = agg(['[unclosed', 'never-matches-xyz']);
+    check('invalid regex entries dropped without crashing', stBad.active.find((r) => r.id === 'game:build').tail === 'ZCode Built-in skipped (not-due)');
+    check('DEFAULT_TAIL_IGNORE matches the not-due chatter', ui.DEFAULT_TAIL_IGNORE.length === 1
+      && new RegExp(ui.DEFAULT_TAIL_IGNORE[0]).test('ZCode Built-in skipped (not-due)')
+      && !new RegExp(ui.DEFAULT_TAIL_IGNORE[0]).test('[09:01] 42 files ok'));
   }
 
   console.log(`\n== RESULT: ${PASS} passed, ${FAIL} failed ==`);
