@@ -16,6 +16,14 @@
  *   zcode_session_cancel cancel the running turn (session/stop interrupt)
  *   zcode_sessions_list  every session in memory or on disk (recovery)
  *   zcode_models         list models available to the harness
+ *   zcode_offpeak_create queue a FREE idle-time (off-peak) task
+ *   zcode_offpeak_list   list idle-time tasks (live queue positions)
+ *   zcode_offpeak_status inspect one idle-time task
+ *   zcode_offpeak_models idle-time allowed models + live eligibility
+ *   zcode_offpeak_cancel stop/cancel an idle-time task
+ *   zcode_offpeak_pause  pause a queued idle-time task
+ *   zcode_offpeak_continue resume a paused idle-time task
+ *   zcode_offpeak_delete remove an idle-time task record
  *
  * zcode_agent / zcode_session_start / zcode_session_send accept async:true to
  * return {sessionId, turnId, status:"running"} immediately — long turns then
@@ -55,6 +63,15 @@ let manager = null;
 function mgr() {
   if (!manager) manager = new AgentManager(cfg, log);
   return manager;
+}
+
+let offPeak = null;
+function off() {
+  if (!offPeak) {
+    offPeak = new (require('./lib/offpeak.cjs').OffPeakManager)({ manager: mgr(), logger: log });
+    offPeak.start();
+  }
+  return offPeak;
 }
 
 // ------------------------------------------------------------------ wire
@@ -216,6 +233,63 @@ const TOOLS = [
       },
       required: ['plan'],
     },
+  },
+  {
+    name: 'zcode_offpeak_create',
+    description: 'Queue a FREE idle-time (off-peak) task: takes a cloud queue ticket now; the task runs unattended on spare capacity during off-peak hours at no plan-quota cost. No guaranteed start time. The prompt must be self-contained and state the deliverable explicitly — nobody answers questions during the run. The run happens in its own session (or a live bridge session when session_id is given, continuing its full history). Constraints: coding-plan subscribers only, one pending task per session, rate-limited creations (errors carry the next-allowed time), the machine must stay awake, and actions needing confirmation pause the run (prefer permission_mode yolo or plan).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string', description: 'Concise task title, no file paths (e.g. "Refactor utils directory").' },
+        prompt: { type: 'string', description: 'Instructions for the unattended run. State the expected deliverable explicitly; never ask the run to create another idle-time task or automation.' },
+        workspace: { type: 'string', description: 'Optional absolute directory the task works in (default: the bridge workspace).' },
+        model: { type: 'string', description: 'Idle-time allowed model id (see zcode_offpeak_models); default = the newest allowed model.' },
+        permission_mode: { type: 'string', enum: ['build', 'edit', 'plan', 'yolo'], description: 'Unattended run permission mode (default yolo). "plan" is read-only; "build" pauses for approval before changes.' },
+        thought_level: { type: 'string', description: 'Reasoning effort for the chosen model (default: highest).' },
+        session_id: { type: 'string', description: 'Optional live bridge session to bind — the run continues that conversation with its full history.' },
+      },
+      required: ['title', 'prompt'],
+    },
+  },
+  {
+    name: 'zcode_offpeak_list',
+    description: 'List idle-time (off-peak) tasks with live status: refreshes queue positions/ticket states from the server and mirrors every task to out/offpeak/<taskId>.json. Task status: queued|paused|running|completed|failed|cancelled; queuePosition and sessionId (once the run started) included.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        refresh: { type: 'boolean', description: 'Poll the server for live ticket state before listing (default true).' },
+      },
+    },
+  },
+  {
+    name: 'zcode_offpeak_status',
+    description: 'Inspect one idle-time task by id (local read, includes ticket state, attempts, timestamps and the on-disk status file path).',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
+    name: 'zcode_offpeak_models',
+    description: 'Idle-time (off-peak) allowed models (from the harness provider registry) plus the default pick, and live eligibility: whether a task can be created right now and, when rate-limited, the next-allowed time.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'zcode_offpeak_cancel',
+    description: 'Cancel an idle-time task (stops a running turn, marks it cancelled, settles its queue ticket). Already-modified files are kept.',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
+    name: 'zcode_offpeak_pause',
+    description: 'Pause a queued idle-time task: the poller stops dispatching it while paused. Pausing longer than the queue-wait limit expires the ticket — continuing then re-queues the task at the tail.',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
+    name: 'zcode_offpeak_continue',
+    description: 'Continue a paused idle-time task (un-pauses; retakes the queue ticket automatically when the old one expired).',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
+  },
+  {
+    name: 'zcode_offpeak_delete',
+    description: 'Delete an idle-time task record (cancels first when still queued/running; the on-disk status file is removed). Irreversible.',
+    inputSchema: { type: 'object', properties: { task_id: { type: 'string' } }, required: ['task_id'] },
   },
 ];
 
@@ -383,6 +457,67 @@ async function handleToolCall(params) {
     return toolResult(`active plan is now ${updated.providerId} (default model ${updated.modelId}, reasoning ${updated.options && updated.options.reasoningLevel})`, { structuredContent: { plan: updated.providerId, model: updated } });
   }
 
+  if (name === 'zcode_offpeak_create') {
+    const task = await off().create({
+      title: args.title,
+      prompt: args.prompt,
+      workspace: args.workspace,
+      model: args.model,
+      permissionMode: args.permission_mode,
+      thoughtLevel: args.thought_level,
+      sessionId: args.session_id,
+    });
+    const pos = typeof task.queuePosition === 'number' ? ` (#${task.queuePosition} in queue)` : '';
+    const text = `Created idle-time task ${task.offPeakTaskId}${pos}.\nstatus: ${task.status}\nmodel: ${task.model.providerId}/${task.model.modelId}\nworkspace: ${task.workspace}\nstatus file: ${off().store.fileFor(task.offPeakTaskId)}\nTrack with zcode_offpeak_list; it runs unattended when off-peak capacity is granted (keep the machine awake).`;
+    return toolResult(text, { structuredContent: task });
+  }
+
+  if (name === 'zcode_offpeak_list') {
+    const result = await off().list({ refresh: args.refresh !== false });
+    return toolResult(JSON.stringify(result, null, 2), { structuredContent: result });
+  }
+
+  if (name === 'zcode_offpeak_status') {
+    if (!args.task_id) return toolError('task_id is required');
+    const task = await off().get(String(args.task_id));
+    return toolResult(JSON.stringify(task, null, 2), { structuredContent: task });
+  }
+
+  if (name === 'zcode_offpeak_models') {
+    const models = off().allowedModels();
+    const def = models.find((m) => m.isDefault) || models[models.length - 1] || null;
+    let availability = null;
+    let availabilityError = null;
+    try { availability = await off().availability(); }
+    catch (e) { availabilityError = e.describe ? e.describe() : e.message; }
+    const result = { default: def ? { providerId: def.providerId, modelId: def.modelId } : null, models, availability, availabilityError };
+    return toolResult(JSON.stringify(result, null, 2), { structuredContent: result });
+  }
+
+  if (name === 'zcode_offpeak_cancel') {
+    if (!args.task_id) return toolError('task_id is required');
+    const task = await off().cancel(String(args.task_id));
+    return toolResult(`idle-time task ${task.offPeakTaskId}: ${task.status}`, { structuredContent: task });
+  }
+
+  if (name === 'zcode_offpeak_pause') {
+    if (!args.task_id) return toolError('task_id is required');
+    const task = await off().pause(String(args.task_id));
+    return toolResult(`idle-time task ${task.offPeakTaskId}: ${task.status}`, { structuredContent: task });
+  }
+
+  if (name === 'zcode_offpeak_continue') {
+    if (!args.task_id) return toolError('task_id is required');
+    const task = await off().continue(String(args.task_id));
+    return toolResult(`idle-time task ${task.offPeakTaskId}: ${task.status}`, { structuredContent: task });
+  }
+
+  if (name === 'zcode_offpeak_delete') {
+    if (!args.task_id) return toolError('task_id is required');
+    const result = await off().delete(String(args.task_id));
+    return toolResult(JSON.stringify(result, null, 2), { structuredContent: result });
+  }
+
   return toolError(`unknown tool: ${name}`);
 }
 
@@ -414,7 +549,7 @@ async function dispatch(msg) {
     return reply(msg.id, {
       protocolVersion,
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: 'zcode-bridge', version: '0.2.0', title: 'ZCode harness bridge' },
+      serverInfo: { name: 'zcode-bridge', version: '0.3.0', title: 'ZCode harness bridge' },
     });
   }
   if (msg.method === 'ping') return reply(msg.id, {});
