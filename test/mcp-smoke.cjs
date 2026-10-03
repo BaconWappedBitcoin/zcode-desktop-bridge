@@ -101,7 +101,22 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   }
   const plansOk = !!pl && pl.plans.length >= 1 && credPlans.length >= 1 && badOk && reSwitchOk;
 
-  const ok = /MCP_SMOKE_OK/.test(String(text)) && planOk && switchOk && plansOk;
+  // async session flow: start (async:true) -> wait -> done + recovery list
+  const st = await call('tools/call', { name: 'zcode_session_start', arguments: { initial_prompt: 'Reply with exactly ASYNC_OK and nothing else. Do not use tools.', async: true } });
+  const stc = (st.result && st.result.structuredContent) || {};
+  console.log('async start =>', JSON.stringify(stc));
+  const wait = await call('tools/call', { name: 'zcode_session_wait', arguments: { session_id: stc.sessionId, timeout_s: 240 } });
+  const wc = (wait.result && wait.result.structuredContent) || {};
+  console.log('wait => status', wc.status, '| finalText:', JSON.stringify(String(wc.finalText || '')).slice(0, 80));
+  const list = await call('tools/call', { name: 'zcode_sessions_list', arguments: {} });
+  const lc = (list.result && list.result.structuredContent) || { sessions: [] };
+  const inList = (lc.sessions || []).some((s) => s.id === stc.sessionId);
+  console.log('sessions_list contains id:', inList, '| total sessions:', (lc.sessions || []).length);
+  const asyncOk = stc.status === 'running' && typeof stc.turnId === 'string'
+    && wc.status === 'done' && /ASYNC_OK/.test(String(wc.finalText || '')) && inList;
+  console.log(asyncOk ? 'ASYNC FLOW OK' : 'ASYNC FLOW FAIL');
+
+  const ok = /MCP_SMOKE_OK/.test(String(text)) && planOk && switchOk && plansOk && asyncOk;
   console.log(ok ? 'SMOKE PASS' : 'SMOKE FAIL');
   child.kill();
   process.exit(ok ? 0 : 1);
