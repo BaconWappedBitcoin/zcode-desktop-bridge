@@ -258,6 +258,8 @@ const deadPid = () => new Promise((resolve) => {
   check('active table shows all three kinds', all140.includes('ses') && all140.includes('idle') && all140.includes('lane'));
   check('status glyphs render (✓ ✗ ◐ ⊘)', all140.includes('◐') && all140.includes('✓') && all140.includes('✗') && all140.includes('⊘'));
   check('plan gauges: percent + banked resets + expiry warning', all140.includes('50%') && all140.includes('banked resets') && all140.includes('⚠ <2h'), all140.split('banked resets')[1] && all140.split('banked resets')[1].split('\n')[0]);
+  check('reset countdown resolves (no "in —")', all140.includes('in 1h30m') && !all140.includes('in —'), all140.split('banked resets')[1] && all140.split('banked resets')[1].split('\n')[0]);
+  check('incoherent used/limit units are omitted (pct still shown)', !all140.includes('used 2k/5') && all140.includes('used 340k/680k'));
   check('offers line + never-claim hint', all140.includes('Flash quota campaign') && all140.includes('never from the UI'));
   check('footer keys line', all140.includes('q quit') && all140.includes('c cancel'));
   check('selection marker on first row', all140.includes('›'));

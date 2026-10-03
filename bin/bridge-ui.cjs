@@ -329,11 +329,14 @@ function gaugeLine(prefix, g) {
   const filled = pct === null ? 0 : Math.round((pct / 100) * barW);
   const bar = pct === null ? '░'.repeat(barW) : '█'.repeat(filled) + '░'.repeat(barW - filled);
   const pctTxt = pct === null ? ' ?%' : ` ${String(Math.round(pct)).padStart(3)}%`;
+  // the quota API reports number/currentValue in different units on some
+  // plans (limit 5, used 2066) — only show the pair when it is coherent
+  const coherent = g.limit !== null && g.used !== null && g.limit > 0 && g.used <= g.limit;
   return [
     seg(` ${prefix}`, 'bold'),
     seg(bar, pct !== null && pct >= 90 ? 'err' : pct >= 70 ? 'warn' : 'ok'),
     seg(pctTxt, 'bold'),
-    seg(`  used ${ui.fmtTokens(g.used)}/${ui.fmtTokens(g.limit)}`, 'dim'),
+    coherent ? seg(`  used ${ui.fmtTokens(g.used)}/${ui.fmtTokens(g.limit)}`, 'dim') : null,
     g.remaining !== null ? seg(` · ${ui.fmtTokens(g.remaining)} left`, 'dim') : null,
     g.nextResetAt ? seg(` · window resets ${hm(Date.parse(g.nextResetAt))}`, 'dim') : null,
   ].filter(Boolean);
