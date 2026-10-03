@@ -10,7 +10,15 @@
  *   GET  /v1/offpeak              list idle-time tasks (live refresh)
  *   POST /v1/offpeak              queue an idle-time task {title, prompt, ...}
  *   GET  /v1/offers               claimable plan offers (detect-only, never claims)
+ *   GET  /ui                      dashboard page (self-contained HTML, dark)
+ *   GET  /v1/ui/state             dashboard aggregate JSON (lib/ui-state.cjs)
+ *   POST /v1/ui/cancel            {kind:"session"|"offpeak", id} — cancel after
+ *                                 the UI's own y/N confirm (the dashboard's only
+ *                                 write besides the messages facade)
  *   GET  /healthz
+ *
+ * Also writes out/bridge.pid + out/bridge.port so the dashboard (and anything
+ * else) can tell the facade is up even before probing /healthz.
  *
  * Run with system Node, or without any Node install via:
  *   ELECTRON_RUN_AS_NODE=1 ZCode.exe server.cjs   (see run-bridge.cmd)
@@ -42,6 +50,11 @@ function loadConfig() {
     maxConcurrentSessions: 8,
     sessionIdleMs: 30 * 60 * 1000,
     modelAliases: {},
+    statusDir: path.join(__dirname, 'out', 'sessions'),
+    offpeakDir: path.join(__dirname, 'out', 'offpeak'),
+    offersDir: path.join(__dirname, 'out', 'offers'),
+    uiDir: path.join(__dirname, 'out', 'ui'),
+    uiWatch: [],
   }, fileCfg);
   if (process.env.PORT) cfg.port = Number(process.env.PORT);
   if (process.env.BIND) cfg.bind = process.env.BIND;
@@ -51,6 +64,11 @@ function loadConfig() {
 
 const cfg = loadConfig();
 const log = (...a) => console.log('[bridge]', new Date().toISOString(), ...a);
+// state dirs resolve against the repo (not the cwd) so the managers below and
+// the dashboard aggregator always read/write the same files
+for (const k of ['statusDir', 'offpeakDir', 'offersDir', 'uiDir']) {
+  if (cfg[k]) cfg[k] = path.resolve(__dirname, cfg[k]);
+}
 const manager = new AgentManager(cfg, (...a) => log('[agent]', ...a));
 const { OffPeakManager, OffPeakApiError } = require('./lib/offpeak.cjs');
 const offPeak = new OffPeakManager({ manager, dir: cfg.offpeakDir, logger: (...a) => log('[offpeak]', ...a) });
@@ -68,6 +86,16 @@ const offers = new OffersManager({
   logger: (...a) => log('[offers]', ...a),
 });
 offers.start();
+
+// Dashboard (GET /ui + /v1/ui/state): the aggregate is pure on-disk state;
+// the only polling it needs — plan usage via READ-ONLY quota APIs, at most
+// every 60 s — runs here and lands in out/ui/plan.json. The TUI reads the
+// same cache, so both front-ends share one reading.
+const { aggregate, PlanUsageCache } = require('./lib/ui-state.cjs');
+const { UI_HTML } = require('./lib/ui-html.cjs');
+const planCache = new PlanUsageCache({ dir: cfg.uiDir, logger: (...a) => log('[plan]', ...a) });
+planCache.ensureFresh().catch(() => {});
+setInterval(() => planCache.ensureFresh().catch(() => {}), 60 * 1000).unref();
 
 // conversation continuity: prevKey -> sessionId, sessionId -> fullKey
 const convCache = new Map();
@@ -302,6 +330,65 @@ async function handleOffers(req, res) {
   }
 }
 
+// ---------------------------------------------------------------- dashboard
+/** GET /ui — the self-contained dashboard page. */
+function handleUiHtml(req, res) {
+  res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+  res.end(UI_HTML);
+}
+
+/** GET /v1/ui/state — the same aggregate the TUI renders (httpUp=true here). */
+function handleUiState(req, res) {
+  planCache.ensureFresh().catch(() => {}); // non-blocking; response serves the disk cache
+  const state = aggregate({
+    rootDir: __dirname,
+    sessionsDir: cfg.statusDir,
+    offpeakDir: cfg.offpeakDir,
+    offersDir: cfg.offersDir,
+    uiDir: cfg.uiDir,
+    watchDirs: cfg.uiWatch,
+    historyMode: /[?&]history=days\b/.test(req.url || '') ? 'days' : 'hours',
+    httpUp: true,
+  });
+  res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-cache' });
+  res.end(JSON.stringify(state));
+}
+
+/** POST /v1/ui/cancel {kind:"session"|"offpeak", id} — the dashboard's only
+ *  write; the TUI/web UI ask y/N before calling this. */
+async function handleUiCancel(req, res) {
+  let body;
+  try {
+    const raw = await readBody(req);
+    body = JSON.parse(raw.toString('utf8'));
+  } catch (e) {
+    return facade.anthropicError(res, 400, 'invalid_request_error', `invalid JSON body: ${e.message}`);
+  }
+  const kind = body.kind;
+  const id = String(body.id || '');
+  if (!id || (kind !== 'session' && kind !== 'offpeak')) {
+    return facade.anthropicError(res, 400, 'invalid_request_error', 'expected {kind: "session"|"offpeak", id}');
+  }
+  try {
+    if (kind === 'session') {
+      const result = await manager.cancelTurn(id);
+      log('ui cancel', { sessionId: id, interrupted: result.interrupted });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(result));
+    } else {
+      const task = await offPeak.cancel(id);
+      log('ui cancel', { offPeakTaskId: id });
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(task));
+    }
+  } catch (e) {
+    if (/unknown session|unknown idle-time task/i.test(e.message || '')) {
+      return facade.anthropicError(res, 404, 'not_found_error', e.message);
+    }
+    facade.anthropicError(res, 500, 'api_error', e.message);
+  }
+}
+
 // ---------------------------------------------------------------- server
 const server = http.createServer(async (req, res) => {
   const url = (req.url || '').split('?')[0];
@@ -318,6 +405,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET' && (url === '/v1/offpeak' || url === '/v1/offpeak/')) return await handleOffpeakList(req, res);
     if (req.method === 'POST' && (url === '/v1/offpeak' || url === '/v1/offpeak/')) return await handleOffpeakCreate(req, res);
     if (req.method === 'GET' && (url === '/v1/offers' || url === '/v1/offers/')) return await handleOffers(req, res);
+    if (req.method === 'GET' && (url === '/ui' || url === '/ui/')) return handleUiHtml(req, res);
+    if (req.method === 'GET' && (url === '/v1/ui/state' || url === '/v1/ui/state/')) return handleUiState(req, res);
+    if (req.method === 'POST' && (url === '/v1/ui/cancel' || url === '/v1/ui/cancel/')) return await handleUiCancel(req, res);
     if (req.method === 'POST' && url === '/v1/messages/count_tokens') {
       const raw = await readBody(req).catch(() => Buffer.alloc(0));
       let n = 0;
@@ -333,7 +423,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && (url === '/' || url === '')) {
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ service: 'zcode-anthropic-bridge', endpoints: ['/v1/messages', '/v1/models', '/v1/messages/count_tokens', '/v1/offpeak', '/v1/offers', '/healthz'] }));
+      res.end(JSON.stringify({ service: 'zcode-anthropic-bridge', endpoints: ['/v1/messages', '/v1/models', '/v1/messages/count_tokens', '/v1/offpeak', '/v1/offers', '/ui', '/v1/ui/state', '/healthz'] }));
       return;
     }
     facade.anthropicError(res, 404, 'not_found_error', `no such endpoint: ${req.method} ${url}`);
@@ -345,14 +435,34 @@ const server = http.createServer(async (req, res) => {
 
 setInterval(() => { manager.reapIdle(cfg.sessionIdleMs).then((n) => { if (n) log('reaped idle sessions', { n }); }).catch(() => {}); }, 5 * 60 * 1000).unref();
 
+// out/bridge.pid + out/bridge.port: liveness beacons for the dashboard and
+// external watchers (lib/ui-state.cjs bridgeStatus reads these first)
+const pidFile = path.join(__dirname, 'out', 'bridge.pid');
+const portFile = path.join(__dirname, 'out', 'bridge.port');
+function writePidPort() {
+  try {
+    fs.mkdirSync(path.join(__dirname, 'out'), { recursive: true });
+    fs.writeFileSync(pidFile, `${process.pid}\n`);
+    fs.writeFileSync(portFile, `${cfg.port}\n`);
+  } catch (e) { log('failed to write pid/port files', { error: e.message }); }
+}
+function clearPidPort() {
+  for (const [f, mine] of [[pidFile, String(process.pid)], [portFile, String(cfg.port)]]) {
+    try { if (fs.readFileSync(f, 'utf8').trim() === mine) fs.unlinkSync(f); } catch { /* gone or ours replaced */ }
+  }
+}
+
 server.listen(cfg.port, cfg.bind, () => {
+  writePidPort();
   log(`zcode-anthropic-bridge listening on http://${cfg.bind}:${cfg.port}`);
   log(`workspace: ${path.resolve(cfg.workspacePath)}  model: ${manager.defaultModel.providerId}/${manager.defaultModel.modelId}`);
+  log(`dashboard: http://${cfg.bind}:${cfg.port}/ui`);
   if (!cfg.apiKey) log('no API key configured — accepting all local requests (set ZCODE_BRIDGE_API_KEY or config.apiKey to require one)');
 });
 
 async function shutdown() {
   log('shutting down…');
+  clearPidPort();
   server.close();
   offPeak.stop();
   offers.stop();
