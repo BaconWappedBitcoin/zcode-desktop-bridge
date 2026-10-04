@@ -263,7 +263,7 @@ const deadPid = () => new Promise((resolve) => {
   const lines140 = stripAnsi(frame140).split('\n');
   check('140-col frame: full height (42 lines)', lines140.length === 42, lines140.length);
   check('140-col frame: no line overflows', lines140.every((l) => l.length <= 140), lines140.find((l) => l.length > 140));
-  check('header: version + up state + clock', /zcode-bridge v0\.5\.1/.test(lines140[0]) && /up/.test(lines140[0]) && /\d{2}:\d{2}:\d{2}/.test(lines140[0]), lines140[0]);
+  check('header: version + up state + clock', /zcode-bridge v\d+\.\d+\.\d+/.test(lines140[0]) && /up/.test(lines140[0]) && /\d{2}:\d{2}:\d{2}/.test(lines140[0]), lines140[0]);
   const all140 = lines140.join('\n');
   check('panels present: PLAN/ACTIVE/HISTORY/OFFERS/EVENTS', ['─ PLAN', '─ ACTIVE', '─ HISTORY', '─ OFFERS', '─ EVENT'].every((p) => all140.includes(p)));
   check('active table shows all three kinds', all140.includes('ses') && all140.includes('idle') && all140.includes('lane'));

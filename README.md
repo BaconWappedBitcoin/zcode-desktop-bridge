@@ -21,6 +21,12 @@ Expose the **ZCode desktop harness** (Windows) through standard interfaces, so a
 >
 > **Which clients count as "ZCode":** this bridge drives the ZCode **desktop** harness (installed: 3.14.4), which meets the 3.10+ requirement. The standalone ZCode CLI reports its own version (0.16.9). Whether the campaigns apply to it isn't documented.
 
+## Monitors at a glance
+
+Track every bridge session, free idle-time task, claimable offer, plan window and your own watched jobs from one place, in the browser or the terminal, independent of any MCP client (details in [Dashboard](#dashboard)).
+
+![zcode-bridge web dashboard](docs/img/dashboard-web.png)
+
 ## GLM-5.3 and exclusive benefits
 
 With GLM-5.3's long context, ZCode can keep track of more files and longer stretches of development within a single task. It keeps moving forward by combining the current workspace, tool results, and Git changes, so even multi-step tasks don't need their background re-explained.
@@ -280,57 +286,22 @@ Plan usage is polled by the server (and by the TUI when it runs standalone) thro
 Extra watch dirs (`uiWatch`) turn any directory of `<name>.pid / <name>.done / <name>.log` triplets into tracked lanes (running while the pid is alive, done/failed from `.done`'s `exit=` value, last log line as the tail) — kept generic, no project-specific code:
 
 ```json
-{ "uiWatch": [ { "name": "game", "dir": "C:/survive2-wt/_logs" } ] }
+{ "uiWatch": [ { "name": "ci", "dir": "C:/my-project/_logs" } ] }
 ```
 
 Tails skip harness chatter: `uiTailIgnore` (regex list, default `["Built-in skipped \\(not-due\\)"]`) — the TAIL column shows the last line that matches none of the patterns, so a stream ending in "ZCode Built-in skipped (not-due)" shows its last real line instead. Set `[]` to disable, or add your own regexes.
 
-Live render (140 cols, real out/ dirs + the watch dir above):
+### Screenshots
 
-```
-zcode-bridge v0.5.1  ● up pid 33876 pid 22668 · :8787                                                           filter:all hist:24h 14:04:10
-─ PLAN ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
- 5h ███░░░░░░░░░░░░░░░  18% · 23k left · window resets 18:16                                                                                
- wk ████████░░░░░░░░░░  43% · 79k left · window resets 07:26                                                                                
- banked resets: 5h ×2 (in 24d18h) · wk ×2 (in 24d18h)                                                                                       
-─ ACTIVE 60/60 ───────────────────────────────────────────────────────────────────────────────────────────────────────────  filter: all [f] 
- KIND  NAME                     MODEL          STATUS      ELAPSED  AGE     TAIL                                                            
-›lane survive2:v-villages-impl —              ● running   70m      2s                                                                       
- lane v-villages-impl          —              ● running   70m      2s                                                                       
- ses  sess_e5d969ec-1e9d-4c4f… GLM-5.3-Flash  ● running   12m      4s      the harness keeps going. Let me read the remaining pieces — con… 
- lane survive2:z-map           —              ● running   71m      10s                                                                      
- lane z-map                    —              ● running   71m      10s                                                                      
- lane survive2:f-female        —              ● running   16m      22s     AI SDK Warning (anthropic.messages / GLM-5.3): The feature "cac… 
- lane f-female                 —              ● running   16m      22s     AI SDK Warning (anthropic.messages / GLM-5.3): The feature "cac… 
- lane survive2:z-world         —              ● running   13m      27s                                                                      
- lane z-world                  —              ● running   13m      27s                                                                      
- lane survive2:p-t038          —              ● running   71m      42s                                                                      
- +50 more (filter: all)                                                                                                                     
-─ HISTORY last 24h ─────────────────────────────────────────────────────────────────────────────────────────────────────────────  [h] range 
- lane:survive2:v-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- lane:v-villages-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- ses:sess_e5d96    │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- lane:survive2:z-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- lane:z-map        │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- lane:survive2:f-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- lane:f-female     │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
- lane:survive2:z-… │ · · · · · · · · · · · · · · · · · · · · · · · ◐                                                                        
-                   │ -24h                                         now                                                                       
-─ OFFERS ────────────────────────────────────────────────────────────────────────────────────────────────────────────────  last check 13:56 
- • 2 banked 5-hour window resets available · ends in 24d18h                                                                                 
- • 2 banked weekly window resets available · ends in 24d18h                                                                                 
- claiming is manual (ZCode app) · resets: zcode_plan_reset — never from the UI                                                              
-─ EVENTS ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── 
- 14:04:06 sessionprogress sess_e5d969ec-1e9d-4c4f-b6a7-953a1f26980 {"sessionId":"sess_e5d969ec-1e9d-4c4f-b6a7-953a1f269807","chars":2000}   
- 14:03:47 sessionprogress sess_e5d969ec-1e9d-4c4f-b6a7-953a1f26980 {"sessionId":"sess_e5d969ec-1e9d-4c4f-b6a7-953a1f269807","chars":2000}   
- 14:03:21 sessionprogress sess_e5d969ec-1e9d-4c4f-b6a7-953a1f26980 {"sessionId":"sess_e5d969ec-1e9d-4c4f-b6a7-953a1f269807","chars":2000}   
- 14:03:04 sessionprogress sess_e5d969ec-1e9d-4c4f-b6a7-953a1f26980 {"sessionId":"sess_e5d969ec-1e9d-4c4f-b6a7-953a1f269807","chars":2000}   
-                                                                                                                                            
-                                                                                                                                            
-                                                                                                                                            
-                                                                                                                                            
- ↑↓ select · ↵ detail · o open · c cancel · f filter · h range · r refresh · ? help · q quit
-```
+Web dashboard (`node server.cjs`, then open `http://127.0.0.1:8787/ui`):
+
+![Web dashboard: plan gauges, active sessions + idle-time tasks + watched lanes, history matrix, offers, events](docs/img/dashboard-web.png)
+
+Terminal dashboard (`node bin/bridge-ui.cjs`, 140 columns):
+
+![Terminal dashboard (TUI): the same panels in a zero-dependency ANSI console](docs/img/dashboard-tui.png)
+
+*Screenshots use a fictional demo state (made-up sessions, lanes and offers), rendered by the real dashboard code.*
 
 ## On-disk session status
 
