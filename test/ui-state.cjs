@@ -245,6 +245,17 @@ const deadPid = () => new Promise((resolve) => {
   check('stale cache + failing fetch: previous quota kept, error surfaced', doc3.error === 'network down'
     && doc3.quota && doc3.quota.limits && doc3.quota.limits[0].usedPercentage === 10, JSON.stringify(doc3).slice(0, 160));
 
+  // a fetch that RESOLVES with per-part errors (no credentials, quota API down)
+  // must not clobber the last good reading either
+  write(cache.file, JSON.stringify({ ...aged, fetchedAt: iso(Date.now() - 5 * 60000) }));
+  const cache4 = new ui.PlanUsageCache({
+    dir: cacheDir, minIntervalMs: 60 * 1000,
+    fetchSnapshot: async () => ({ quota: { error: 'no local credentials' }, resets: { error: 'ENOENT credentials.json' } }),
+  });
+  const doc4 = await cache4.ensureFresh();
+  check('resolved-with-errors fetch: previous quota kept + quotaError recorded', doc4.quota && doc4.quota.limits
+    && doc4.quota.limits[0].usedPercentage === 10 && doc4.quotaError === 'no local credentials', JSON.stringify(doc4).slice(0, 200));
+
   console.log('== 11. TUI snapshot renders (80 and 140 cols, ANSI stripped) ==');
   const stateR = ui.aggregate({ rootDir: root1, sessionsDir, offpeakDir, offersDir, uiDir, watchDirs: [{ name: 'game', dir: laneDir }], now: NOW, historyMode: 'hours' });
   const view = { mode: 'dashboard', selected: 0, filter: 'all', historyMode: 'hours', confirm: null, toast: null, detailScroll: 0, detailRowId: null };
