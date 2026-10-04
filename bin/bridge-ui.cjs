@@ -277,7 +277,7 @@ function renderFrame(state, view, opts = {}) {
   L(panelTitle('EVENTS', width));
   for (const e of state.events.slice(0, Math.max(2, Math.min(4, height - 38)))) {
     L([
-      seg(` ${clock(e.tsMs)} `, 'dim'), seg(padEndW(e.kind, 6), 'accent'), seg(`${e.event} `, 'bold'),
+      seg(` ${clock(e.tsMs)} `, 'dim'), seg(`${padEndW(e.kind, 7)} `, 'accent'), seg(`${e.event} `, 'bold'),
       seg(truncW(`${e.name} ${e.detail || ''}`, Math.max(8, width - vw(` ${clock(e.tsMs)} ${e.kind} ${e.event} `) - 1)), 'dim'),
     ]);
   }
