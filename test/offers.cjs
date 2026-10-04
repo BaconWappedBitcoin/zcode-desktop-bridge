@@ -307,7 +307,7 @@ function makeManager(opts = {}) {
     const forbidden = new RegExp(['billing', 'claim'].join('/') + '|X-Aliyun' + '-Captcha|captchaVerify' + 'Param', 'i');
     const offenders = [];
     for (const f of files) {
-      const lines = fs.readFileSync(f, 'utf8').split('\n');
+      const lines = fs.readFileSync(f, 'utf8').split(/\r?\n/); // CRLF checkouts too
       lines.forEach((line, i) => {
         const code = line.replace(/^\s*\/\/.*$/, '').replace(/^\s*\*.*$/, '').replace(/^\s*\/\*.*$/, '');
         if (forbidden.test(code)) offenders.push(`${path.relative(root, f)}:${i + 1}: ${line.trim().slice(0, 120)}`);
