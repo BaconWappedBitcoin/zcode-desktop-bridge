@@ -179,6 +179,29 @@ function makeOff(opts = {}) {
     ['dispatch-started', 'turn-completed', 'settled'].every((k) => log6.some((l) => l.event === k)), log6.map((l) => l.event).join(','));
   o6.m.stop();
 
+  console.log('== 6b. real _runTask sends the desktop-identical modelExecution params ==');
+  {
+    let seen = null;
+    const dir6b = fs.mkdtempSync(path.join(os.tmpdir(), 'zbridge-offpeak-'));
+    tmpDirs.push(dir6b);
+    const mgr6b = fakeManager(dir6b);
+    mgr6b.ensureClient = async () => ({});
+    mgr6b._activateAccount = async () => ({ models: [] });
+    mgr6b.createSession = async () => ({ sessionId: 'run-6b' });
+    mgr6b.runTurn = async (sid, prompt, opts) => { seen = { sid, prompt, opts }; return { finalText: 'ok' }; };
+    const o6b = makeOff({ manager: mgr6b });
+    o6b.cloud.auth = o6b.cloud.auth || { jwt: 'jwt-test', planKey: 'pk-test' };
+    const t6b = await o6b.m.create({ title: 'params', prompt: 'p' });
+    const task6b = o6b.m._byId(t6b.offPeakTaskId);
+    task6b.serverTicketId = task6b.serverTicketId || 'tick-6b';
+    await o6b.m._runTask(task6b);
+    const me = seen && seen.opts && seen.opts.extraSendParams && seen.opts.extraSendParams.modelExecution;
+    check('modelExecution.selectionScope === "execution" (harness schema requires it)', !!me && me.selectionScope === 'execution', JSON.stringify(me));
+    check('modelExecution.memoryExtraction === "skip" + requestAuth present', !!me && me.memoryExtraction === 'skip' && !!me.requestAuth);
+    check('off-peak run type + task id sent', seen.opts.extraSendParams.offPeakRunType === 'init' && seen.opts.extraSendParams.offPeakTaskId === task6b.id);
+    o6b.m.stop();
+  }
+
   console.log('== 7. failed run -> failed status + error retained ==');
   const o7 = makeOff();
   o7.m._runTask = async () => { throw new Error('provider exploded'); };
