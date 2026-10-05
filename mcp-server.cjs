@@ -231,6 +231,11 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
+    name: 'zcode_plan_route',
+    description: 'Which plan currently has credit for a model (owner 2026-10-05 dynamic routing): ordered candidates per model from config.json planRouter, skipping plans without local credentials, with an exhausted 5-hour window, or under the weekly reserve kept for GLM-5.3; start plans are desktop-app only. Returns providerId (or null + waitUntil) and every candidate with its reason. Use model "auto:<modelId>" on zcode_session_start / zcode_model_set to route automatically.',
+    inputSchema: { type: 'object', properties: { model: { type: 'string', description: 'Model id, e.g. "GLM-5.3-Flash".' } }, required: ['model'] },
+  },
+  {
     name: 'zcode_plans',
     description: 'List every plan known to the harness (individual/team/start/off-peak coding plans), which ones this machine holds credentials for, live token availability per window (5-hour / weekly remaining, usage %, next reset) for those, and which plan is currently active for the bridge. Use zcode_plan_switch to change the active plan.',
     inputSchema: { type: 'object', properties: {} },
@@ -464,6 +469,12 @@ async function handleToolCall(params) {
 
   if (name === 'zcode_plan_reset_opportunity') {
     const result = await codingPlan.requestOpportunity();
+    return toolResult(JSON.stringify(result, null, 2), { structuredContent: result });
+  }
+
+  if (name === 'zcode_plan_route') {
+    if (!args.model) return toolError('model is required');
+    const result = await require('./lib/plan-router.cjs').route(String(args.model), { policy: cfg.planRouter });
     return toolResult(JSON.stringify(result, null, 2), { structuredContent: result });
   }
 
