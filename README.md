@@ -156,6 +156,7 @@ A ready-made system prompt for Claude lives in [`CLAUDE-DESKTOP-PROMPT.md`](CLAU
 | `zcode_sessions_list` | every session in memory **or on disk** — the recovery path for a sessionId lost to a client timeout |
 | `zcode_models` / `zcode_model_set` | list catalog; switch default or live-session model (mid-conversation, history kept) |
 | `zcode_plans` | every plan, which have local credentials, **live token availability** per window |
+| `zcode_plan_route` | which plan currently **has credit** for a model (per-model candidates, 5h/weekly windows, weekly reserve for GLM-5.3; start plans are desktop-only) — `model: "auto:<id>"` on sessions routes automatically |
 | `zcode_plan_switch` | activate another credentialed plan (entitlement push + validation + default model) |
 | `zcode_plan_usage` | current 5-hour/weekly windows + banked resets |
 | `zcode_plan_reset` | **consume one banked reset** (irreversible; refuses when nothing is banked) |
@@ -165,6 +166,32 @@ A ready-made system prompt for Claude lives in [`CLAUDE-DESKTOP-PROMPT.md`](CLAU
 | `zcode_offpeak_models` | idle-time allowed models + live eligibility (next-allowed time when throttled) |
 | `zcode_offpeak_cancel` / `_pause` / `_continue` / `_delete` | task lifecycle actions |
 | `zcode_offers` | claimable plan offers + banked reset opportunities (detect-only, **never claims**; see "Offer notifications") |
+
+## Plan routing (credit-aware)
+
+`lib/plan-router.cjs` picks the coding plan that currently has credit for a model instead of hard-coding one:
+
+- ordered **candidates per model** (`config.json` → `planRouter.candidates`, e.g. `GLM-5.3-Flash: [start, individual, team]`, `GLM-5.3: [individual, team]`);
+- a candidate is skipped when this machine holds **no credentials** for it, its **5-hour window** is exhausted, its **weekly window** is exhausted, or (for plans in `reserveAppliesTo`, when routing anything but `reserveFor`) its weekly balance is under `weeklyReservePct` — the last slice of the individual plan stays reserved for GLM-5.3 work;
+- **start plans** (`account:*-start-plan`) are excluded unless `allowStartPlan` is set: the `zcode.z.ai/api/v1/zcode-plan` proxy only serves the desktop app (other clients get code 3012), see "Status & disclaimer";
+- quota lookups are cached (`cacheMs`, default 60 s); keys are never read, logged or returned.
+
+Three surfaces use it:
+
+| Surface | How |
+|---|---|
+| MCP | `zcode_plan_route {model}` → `{providerId \| null, reason, waitUntil, candidates[]}` |
+| Sessions / default model | `model: "auto:GLM-5.3-Flash"` on `zcode_session_start`, `zcode_agent`, `zcode_model_set` routes at start time (activates the plan in the registry if needed) |
+| Shell / launchers | `node bin/plan-route.cjs <modelId> [--json]` prints the provider id; **exit 2** with a JSON reason + `waitUntil` on stderr when no plan has credit — launchers refuse to start a lane that would die on 429 |
+
+Example (2026-10-05, weekly window exhausted):
+
+```
+$ node bin/plan-route.cjs GLM-5.3
+{"error":"no candidate plan has credit for GLM-5.3; next reset 2026-10-11T11:09:07.999Z","waitUntil":"2026-10-11T11:09:07.999Z", ...}
+```
+
+Policy test: `node test/plan-router.cjs` (mocked quota, no network).
 
 ## Async turns (never lose a session to a tool timeout)
 
@@ -367,6 +394,8 @@ Copy `config.example.json` → `config.json`:
 
 Env overrides: `ZCODE_EXE`, `ZCODE_BUNDLE`, `ZCODE_DIR`, `ZCODE_HOME`, `ZCODE_BUILTIN_FILE`, `ZCODE_CREDENTIAL_SECRET`, `ZCODE_PLAN_ORIGIN`, `ZCODE_QUOTA_ORIGIN`.
 
+- `planRouter` — credit-aware routing policy (candidates per model, `weeklyReservePct`, `reserveAppliesTo`, `reserveFor`, `allowStartPlan`, `cacheMs`); see **Plan routing** and `config.example.json`.
+
 ## How it talks to the harness
 
 Verified against ZCode desktop 3.14.4 / agent 0.16.9 (see `proto-probe.cjs`, the instrumented explorer):
@@ -386,6 +415,8 @@ Verified against ZCode desktop 3.14.4 / agent 0.16.9 (see `proto-probe.cjs`, the
 
 ## Testing
 
+- `node test/plan-router.cjs` — routing policy over mocked quota (no network, no quota spent).
+
 ```bash
 bash test/e2e.sh          # facade: health, stream/non-stream, continuity, validation (18 checks)
 node test/mcp-smoke.cjs   # MCP: handshake, agent turn, model switch cycle, plans, quota, async flow
@@ -396,6 +427,8 @@ node test/ui-state.cjs    # dashboard: aggregator parsing, stale bridge, history
 ```
 
 ## Project layout
+
+- `lib/plan-router.cjs` — credit-aware plan routing; `bin/plan-route.cjs` — one-line CLI for launchers; `test/plan-router.cjs`.
 
 ```
 server.cjs                Anthropic Messages facade (HTTP/SSE) + /v1/offpeak + /v1/offers + /ui dashboard
@@ -417,5 +450,7 @@ proto-probe.cjs           protocol exploration harness (dev tool)
 ```
 
 ## Status & disclaimer
+
+- **Start plans are desktop-only.** The ZCode Start Plan (trust-build Flash credits) authenticates with the ZCode session rather than a coding-plan API key; the bridge can entitle it and hand the app-server the right headers (branch `start-plan-routing`), but `zcode.z.ai` answers `405 / code 3012 "blocked due to unusual activity"` to any client that is not the signed desktop app. We do not forge those signatures, so the router marks start plans unusable.
 
 Unofficial, not affiliated with Z.ai or the ZCode team. The wire protocol and backend endpoints above are reverse-engineered from the installed desktop app and may change between versions — if something breaks after a ZCode update, re-run `proto-probe.cjs` and `node test/mcp-smoke.cjs` to see what moved.
