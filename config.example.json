@@ -14,11 +14,44 @@
   "offersPollMs": 600000,
   "offerToasts": true,
   "uiWatch": [
-    { "name": "game", "dir": "C:/survive2-wt/_logs" }
+    {
+      "name": "game",
+      "dir": "C:/survive2-wt/_logs"
+    }
   ],
-  "uiTailIgnore": ["Built-in skipped \\(not-due\\)"],
+  "uiTailIgnore": [
+    "Built-in skipped \\(not-due\\)"
+  ],
   "modelAliases": {
-    "claude-sonnet-4-5": { "providerId": "account:zai-individual-coding-plan", "modelId": "GLM-5.3-Flash", "reasoningLevel": "high" },
-    "claude-opus-4-6": { "providerId": "account:zai-individual-coding-plan", "modelId": "GLM-5.3", "reasoningLevel": "max" }
+    "claude-sonnet-4-5": {
+      "providerId": "account:zai-individual-coding-plan",
+      "modelId": "GLM-5.3-Flash",
+      "reasoningLevel": "high"
+    },
+    "claude-opus-4-6": {
+      "providerId": "account:zai-individual-coding-plan",
+      "modelId": "GLM-5.3",
+      "reasoningLevel": "max"
+    }
+  },
+  "planRouter": {
+    "candidates": {
+      "GLM-5.3-Flash": [
+        "account:zai-start-plan",
+        "account:zai-individual-coding-plan",
+        "account:zai-team-coding-plan"
+      ],
+      "GLM-5.3": [
+        "account:zai-individual-coding-plan",
+        "account:zai-team-coding-plan"
+      ]
+    },
+    "weeklyReservePct": 10,
+    "reserveAppliesTo": [
+      "account:zai-individual-coding-plan"
+    ],
+    "reserveFor": "GLM-5.3",
+    "allowStartPlan": false,
+    "cacheMs": 60000
   }
 }
