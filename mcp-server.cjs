@@ -220,10 +220,16 @@ const TOOLS = [
       type: 'object',
       properties: {
         type: { type: 'string', enum: ['five_hour', 'week'], description: 'Which window to reset.' },
-        force: { type: 'boolean', description: 'Skip the availability pre-check (default false).' },
+        force: { type: 'boolean', description: 'Skip the availability pre-check AND the reset policy (default false).' },
+        queuedWork: { type: 'boolean', description: 'Caller has GLM work queued/stalled (the reset policy requires it by default).' },
       },
       required: ['type'],
     },
+  },
+  {
+    name: 'zcode_plan_reset_advise',
+    description: 'Dry run: should a banked 5-hour reset be spent now? Applies config.json resetPolicy (owner 2026-10-06): only when the 5-hour window is nearly exhausted, GLM work is queued, the natural reset is far enough away, and the weekly window has room. Returns spend true/false, reasons, minutesSaved (time to the natural reset) and weekly remaining. Spends nothing.',
+    inputSchema: { type: 'object', properties: { queuedWork: { type: 'boolean', description: 'Caller has GLM work queued/stalled.' } } },
   },
   {
     name: 'zcode_plan_reset_opportunity',
@@ -462,8 +468,23 @@ async function handleToolCall(params) {
     return toolResult(JSON.stringify(snap, null, 2), { structuredContent: snap });
   }
 
+  if (name === 'zcode_plan_reset_advise') {
+    const snap = await codingPlan.getPlanSnapshot();
+    const advice = require('./lib/reset-policy.cjs').evaluate(snap, cfg.resetPolicy, { queuedWork: args.queuedWork === true });
+    return toolResult(JSON.stringify(advice, null, 2), { structuredContent: advice });
+  }
+
   if (name === 'zcode_plan_reset') {
-    const result = await codingPlan.useReset(String(args.type || ''), { force: args.force === true });
+    const type = String(args.type || '');
+    if (args.force !== true && (type === 'five_hour' || type === 'FIVE_HOUR')) {
+      const snap = await codingPlan.getPlanSnapshot();
+      const advice = require('./lib/reset-policy.cjs').evaluate(snap, cfg.resetPolicy, { queuedWork: args.queuedWork === true });
+      if (!advice.spend) {
+        const refused = { used: false, refusedByPolicy: true, advice };
+        return toolResult(JSON.stringify(refused, null, 2), { structuredContent: refused });
+      }
+    }
+    const result = await codingPlan.useReset(type, { force: args.force === true });
     return toolResult(JSON.stringify(result, null, 2), { structuredContent: result });
   }
 

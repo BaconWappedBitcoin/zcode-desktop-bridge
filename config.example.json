@@ -53,5 +53,14 @@
     "reserveFor": "GLM-5.3",
     "allowStartPlan": false,
     "cacheMs": 60000
+  },
+  "resetPolicy": {
+    "enabled": true,
+    "minFiveHourUsedPct": 98,
+    "minMinutesToNaturalReset": 60,
+    "minWeeklyRemaining": 0,
+    "minWeeklyRemainingPct": 2,
+    "requireQueuedWork": true,
+    "keepBanked": 0
   }
 }
