@@ -22,6 +22,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
+const harnessEnv = require('./lib/harness-env.cjs');
 
 const args = process.argv.slice(2);
 function arg(name, def) {
@@ -59,7 +60,7 @@ const listeners = [];
 
 function startChild() {
   child = spawn(EXE, [BUNDLE, 'app-server', '--stdio', '--surface', 'desktop'], {
-    env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+    env: { ...process.env, ...harnessEnv.providerRuntimeEnv(BUNDLE), ELECTRON_RUN_AS_NODE: '1' },
     cwd: WORKSPACE, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
   });
   child.stdout.setEncoding('utf8');
@@ -227,8 +228,13 @@ function accountApiKey(providerId) {
 function computeBuiltinRevision() {
   // The worker's registry CAS-compares basedOnZCodeBuiltinRevision against
   // `zcode-builtin:<fileRevision>:<sha256(path.resolve(activePath))>` where
-  // activePath is the runtime-cached zcode-builtin.json. Verified against the
-  // live worker's own accountRevision telemetry.
+  // activePath is the runtime-cached zcode-builtin.json (<= 3.15) or the packaged
+  // file handed over via ZCODE_BUILTIN_PROVIDER_CONFIG_FILE (>= 3.16). Verified
+  // against the live worker's own accountRevision telemetry.
+  if (harnessEnv.builtinProviderConfigFile(BUNDLE)) {
+    const [first] = harnessEnv.builtinRevisionCandidates({ bundle: BUNDLE });
+    if (first) return first;
+  }
   try {
     const cryptoMod = require('crypto');
     const base = path.join(USER_DIR, '.zcode', 'v2', 'runtime', 'provider', 'windows-x86_64');

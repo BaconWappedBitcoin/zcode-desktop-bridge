@@ -378,6 +378,8 @@ Copy `config.example.json` → `config.json`:
 | `apiKey` | *(none)* | require matching `x-api-key`/Bearer (env `ZCODE_BRIDGE_API_KEY`) |
 | `workspacePath` | `<repo>/bridge-workspace` | where agent sessions run |
 | `mode` | `yolo` | harness permission mode (auto-approve the agent's own tool use) |
+| `model` | desktop `provider_config.json` default, else `account:zai-individual-coding-plan` / `GLM-5.3-Flash` | bridge default model `{providerId, modelId, options?}`; any harness provider works, including personal API-key providers (e.g. a DeepSeek provider added in ZCode: `{"providerId":"<its uuid>","modelId":"deepseek-v4-pro"}`, see `zcode_models`). Credentialed coding plans are still activated, so per-call `model` overrides like `GLM-5.3` keep resolving. A session never falls back to a different provider than the one asked for |
+| `runtimePrefs` | `{}` | merged into the bridge's answer to `session/requestRuntimePreferences` (base: `nativeSearchEnhancementsEnabled`, `memoryEnabled`, `askUserQuestionAutoResolutionEnabled`, `modelContextBudgetStrategy`). `{"toolSearchMode":"local"}` loads MCP tool schemas on demand instead of with every turn: with ~500 tools from user-level ZCode MCP servers, a trivial turn went from ~148k to ~19k input tokens (values: `off` (harness default), `local`, `auto`) |
 | `modelAliases` | *(map)* | map request model names → harness selections; unknown models use the harness default |
 | `exposeThinking` | `false` | stream harness reasoning as `thinking` blocks |
 | `includeToolActivity` | `false` | log internal tool activity |
@@ -392,17 +394,18 @@ Copy `config.example.json` → `config.json`:
 | `uiWatch` | *(none)* | extra dirs of `<name>.pid/.done/.log` triplets shown as lanes in the dashboard (see "Dashboard") |
 | `uiTailIgnore` | `["Built-in skipped \\(not-due\\)"]` | regex sources for dashboard-tail chatter; the tail shows the last line that matches none of them (`[]` disables) |
 
-Env overrides: `ZCODE_EXE`, `ZCODE_BUNDLE`, `ZCODE_DIR`, `ZCODE_HOME`, `ZCODE_BUILTIN_FILE`, `ZCODE_CREDENTIAL_SECRET`, `ZCODE_PLAN_ORIGIN`, `ZCODE_QUOTA_ORIGIN`.
+Env overrides: `ZCODE_EXE`, `ZCODE_BUNDLE`, `ZCODE_DIR`, `ZCODE_HOME`, `ZCODE_BUILTIN_FILE`, `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`, `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_CREDENTIAL_SECRET`, `ZCODE_PLAN_ORIGIN`, `ZCODE_QUOTA_ORIGIN`.
 
 - `planRouter` — credit-aware routing policy (candidates per model, `weeklyReservePct`, `reserveAppliesTo`, `reserveFor`, `allowStartPlan`, `cacheMs`); see **Plan routing** and `config.example.json`.
 
 ## How it talks to the harness
 
-Verified against ZCode desktop 3.14.4 / agent 0.16.9 (see `proto-probe.cjs`, the instrumented explorer):
+Verified against ZCode desktop 3.14.4 / agent 0.16.9 and 3.17.2 / agent 0.17.1 (see `proto-probe.cjs`, the instrumented explorer):
 
 - The desktop host runs one **ZCode Protocol app-server** per workspace — `ELECTRON_RUN_AS_NODE=1 ZCode.exe zcode.cjs app-server --stdio`, newline-delimited JSON-RPC, no handshake. Sessions: `session/create` → `session/setModel` (needs an explicit `options.reasoningLevel`) → `session/subscribe {deliveryKind:"desktop-continuous"}` → `session/send`. Completion = `v4/telemetry {kind:"turn.terminal"}`; final text lives in `session/messages` parts (`text`, `reasoning`, `step-finish` with usage).
-- Worker app-servers start with account providers **unentitled**. The bridge replays the desktop host's `provider/updateAccountConfig` push; the registry CAS-checks `basedOnZCodeBuiltinRevision` against `zcode-builtin:<revision>:<sha256(active file path)>`, computed from the runtime-cached registry. A session's model list freezes at creation, so entitlement is verified with a session created *after* the push.
-- Model calls trigger a server→client `interaction/requestProviderRuntimeHeaders` request; the bridge answers with the coding-plan API key decrypted from `~/.zcode/v2/credentials.json` (`enc:v1:` = AES-256-GCM with a machine-derivable secret — the same scheme the CLI uses). Keys never leave the process except to the app-server over its private stdio pipe, and are never logged.
+- **ZCode ≥ 3.16** packages the built-in provider config at `resources/config/provider/zcode-builtin.json` instead of next to the CLI bundle. The desktop host hands it to its app-server as `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` plus `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` (`~/.zcode/v2/provider_config.json`; the runtime rejects one without the other), and the bridge does the same. Without them the app-server exits at once with `无法定位 CLI ZCode Built-in Provider Config`. Older layouts get no extra env.
+- Worker app-servers start with account providers **unentitled**. The bridge replays the desktop host's `provider/updateAccountConfig` push; the registry CAS-checks `basedOnZCodeBuiltinRevision` against `zcode-builtin:<revision>:<sha256(active file path)>`, where the active file is the runtime-cached registry (≤ 3.15) or the packaged file above (≥ 3.16). A push with the wrong revision is still answered `"received"` but changes nothing, and a session's model list freezes at creation, so entitlement is verified with a session created *after* the push.
+- Model calls trigger a server→client `interaction/requestProviderRuntimeHeaders` request; the bridge answers with the coding-plan API key decrypted from `~/.zcode/v2/credentials.json` (`enc:v1:` = AES-256-GCM with a machine-derivable secret — the same scheme the CLI uses). Up to 3.16 the key entry is found through an `account-provider:<plan>:identity` entry; 3.17 drops that entry and keeps the account id only in the key entry's name (`account-provider:coding-plan:<plan>:account:<id>:api-key`), which the bridge uses when exactly one account holds the plan. Personal API-key providers need no header answer: the app-server reads their key from `provider_config.json` itself. Keys never leave the process except to the app-server over its private stdio pipe, and are never logged.
 - Plan quota/resets use the desktop's own backend calls: `GET api.z.ai/api/monitor/usage/quota/limit` (plan API key; unit 3 = 5-hour window, unit 6 = weekly) and `zcode.z.ai/api/v1/coding-plan/reset/{status,use,opportunity}` (zcode JWT + MaaS token headers; `reset_type` is `"FIVE_HOUR" | "WEEK"`, idempotency keys must be UUIDs).
 - Idle-time tasks: the app-server has no offPeak RPCs — `offPeak/create`/`offPeak/list` are server→client requests the *host* answers (the desktop from its task service, the bridge from `lib/offpeak.cjs`). Tickets: `zcode.z.ai/api/v1/off-peak/ticket{,/status,/<id>/settle}` + `GET …/ticket/availability` (all live-verified). A ready ticket's run carries `modelExecution.requestAuth` with `X-Off-Peak-Ticket-ID` (plus JWT + plan API key) — that's what makes it free.
 - Offer detection mirrors the desktop's own calls (all read-only, live-verified): `GET zcode.z.ai/api/v1/zcode-plan/billing/preview` (claimable plan list; needs the `X-Device-Mid` header), `GET /api/v1/marketing/touch` (banner/popup campaign deliveries with `ends_at`), and the reset/status read above. The claim endpoint is deliberately **not** implemented anywhere in the bridge (a static test enforces that).
@@ -424,6 +427,8 @@ node test/async-flow.cjs  # async turns, status files, sessions_list, timeout, c
 node test/offpeak.cjs     # idle-time tasks: create/refresh/dispatch/requeue/pause/cancel + host RPCs (46 checks, mocked ticket API — no network)
 node test/offers.cjs      # offer detection: normalize/dedup/expiry/pid-lock + static no-claim-endpoint guard (35 checks, no network)
 node test/ui-state.cjs    # dashboard: aggregator parsing, stale bridge, history buckets, PlanUsageCache, TUI snapshots 80/140 cols + no-claim guard (85 checks, no network)
+node test/harness-env.cjs      # install layouts 3.14→3.17: provider-config env, CAS revision candidates, both credential-store layouts (17 checks, temp dirs — no harness)
+node test/model-selection.cjs  # personal default provider + plan activation, per-call overrides, no cross-provider fallback (11 checks, mocked protocol)
 ```
 
 ## Project layout
