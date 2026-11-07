@@ -205,7 +205,19 @@ zcode_session_wait    { "session_id": "…", "timeout_s": 60 }     → { status:
 zcode_session_cancel  { "session_id": "…" }                      → { status: "cancelled", interrupted }
 ```
 
-`zcode_session_wait` returns `finalText` (when done), `lastOutput`, `usage {input, output, cacheRead}` and `model`. `zcode_agent` and `zcode_session_send` take the same `async: true` flag; blocking behavior is unchanged without it.
+`zcode_session_wait` returns `finalText` (when done), `lastOutput`, `usage {input, output, cacheRead}` and `model`. `zcode_agent` and `zcode_session_send` take the same `async: true` flag; blocking behavior is unchanged without it. `asyncByDefault: true` in `config.json` makes all three turn-starting tools async unless a call says `async: false`.
+
+### Waiting in the background, with the turn live (Claude Code)
+
+`zcode_session_wait` holds the calling session for as long as it waits: a 600 s wait is ten minutes in which the client does nothing else. Wait in the client's own background tasks instead: every async start returns a watcher command (`watch`, with `howToWait`, in `structuredContent`, which is what Claude Code shows the model):
+
+```
+node "<repo>/bin/zcode-watch.cjs" <sessionId> [--events]
+```
+
+It follows the session's current turn and exits when it ends: `0` done, `1` error, `2` cancelled, `3` the bridge went away mid-turn, `4` no such session. Its output is the turn as it happens (the prompt, the text with each model step on its own line, one `↳ <tool>: <description>  $ <command>` line per tool step and `✗` for a failed one, a footer with time and tokens), then the full final answer. Run through **Bash with `run_in_background: true`**, the session keeps working, the person can watch the turn live in the task's output, and the model is notified once, when it exits. With `--events` it prints only the tool steps and the end, for the **Monitor** tool (a notification per line). The server's `instructions` say the same to every new session.
+
+Claude Code 2.1.317 also carries a client for the MCP Tasks extension ([SEP-2663](https://modelcontextprotocol.io/seps/2663-tasks-extension), `io.modelcontextprotocol/tasks`), which would make a long tool call a native background task by itself; it declares the extension only behind a rollout flag (`out/mcp-client.json` records what a client declared at `initialize`), so the watcher is the way today.
 
 **Async turns detach instead of failing.** Blocking calls error at `turnTimeoutMs` (config, default 900 s) as before. Async turns live under a separate, much larger `asyncTurnTimeoutMs` (config, default **6 h**) — and even past that wait deadline the bridge does **not** record an error: the status file keeps saying `"running"` with `detached: true` (plus `waitDeadlineHitAt`), the event log gains a `turn-detached` line, and the bridge keeps consuming the harness's notifications so the status file still reaches `done`/`error`/`cancelled` with the real `finalText` when the turn actually ends. `zcode_session_wait` on a detached turn keeps returning `running` (with the `detached` flag) until then; `zcode_session_cancel` still interrupts it. Before this fix (≤0.5.0), a long async turn was marked `"error"` at 900 s while the harness kept editing files — external watchers reported a false failure and the final text was lost to the status file.
 
@@ -335,6 +347,8 @@ Terminal dashboard (`node bin/bridge-ui.cjs`, 140 columns):
 Every session is mirrored to `statusDir` (config, default `<repo>/out/sessions/`) so external watchers — bash scripts, another terminal — can follow turns without talking to the bridge:
 
 - `<sessionId>.json` — replaced **atomically** (temp file + rename) on every state change and at most every 5 s while streaming. Never partially written.
+- `<sessionId>.stream.log` — the live, readable stream of every turn, appended as it happens: a header with the prompt, the text (each model step on its own line), one line per tool step, a footer with status, time and tokens. `bin/zcode-watch.cjs` follows it.
+- `<sessionId>.final.md` — the full final answer (or error) of the last finished turn, written before the status says the turn ended.
 - `<sessionId>.log` — one NDJSON line per lifecycle event (`session-created`, `turn-started`, `progress` (≤1/5 s while streaming), `turn-detached`, `turn-completed`, `turn-failed`, `turn-cancelled`, `cancel-requested`, `model-changed`, `session-closed`), each shaped `{ts, sessionId, event, …}`. A summary, not a transcript.
 
 Schema of `<sessionId>.json` (timestamps are epoch ms):
@@ -384,6 +398,7 @@ Copy `config.example.json` → `config.json`:
 | `exposeThinking` | `false` | stream harness reasoning as `thinking` blocks |
 | `includeToolActivity` | `false` | log internal tool activity |
 | `turnTimeoutMs` / `sessionIdleMs` | `900000` / `1800000` | blocking-turn cap; idle-session reaping |
+| `asyncByDefault` | `false` | `true`: `zcode_agent`, `zcode_session_start` and `zcode_session_send` return at once unless a call says `async: false`, with a background watcher command to wait with (see "Waiting in the background") |
 | `asyncTurnTimeoutMs` | `21600000` (6 h) | async-turn wait deadline; past it the turn detaches (status stays `running` + `detached`) instead of erroring (see "Async turns") |
 | `statusDir` | `<repo>/out/sessions/` | on-disk session status files (see "On-disk session status") |
 | `offpeakDir` | `<repo>/out/offpeak/` | on-disk idle-time task files (see "On-disk idle-time task status") |
@@ -429,6 +444,7 @@ node test/offers.cjs      # offer detection: normalize/dedup/expiry/pid-lock + s
 node test/ui-state.cjs    # dashboard: aggregator parsing, stale bridge, history buckets, PlanUsageCache, TUI snapshots 80/140 cols + no-claim guard (85 checks, no network)
 node test/harness-env.cjs      # install layouts 3.14→3.17: provider-config env, CAS revision candidates, both credential-store layouts (17 checks, temp dirs — no harness)
 node test/model-selection.cjs  # personal default provider + plan activation, per-call overrides, no cross-provider fallback (11 checks, mocked protocol)
+node test/live-stream.cjs      # the live stream and final-answer files, and bin/zcode-watch.cjs following a turn: live, --events, failure (17 checks, mocked protocol)
 ```
 
 ## Project layout

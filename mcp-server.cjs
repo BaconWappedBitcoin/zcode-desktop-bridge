@@ -105,10 +105,43 @@ function toolError(text) {
   return { content: [{ type: 'text', text: String(text) }], isError: true };
 }
 
+// ---------------------------------------------------------------- waiting without blocking
+// A ZCode turn takes minutes. A client that waits on it (a blocking call, or zcode_session_wait) is held for
+// all of that time. bin/zcode-watch.cjs follows a turn live and exits when it ends, so a client with
+// background tasks (Claude Code: Bash run_in_background, or Monitor) waits for it while it keeps working.
+// config asyncByDefault: true makes the turn-starting tools return at once unless a call says async:false.
+const ASYNC_DEFAULT = cfg.asyncByDefault === true;
+const WATCH_SCRIPT = path.join(__dirname, 'bin', 'zcode-watch.cjs').replace(/\\/g, '/');
+const asyncOf = (args) => (args.async === undefined ? ASYNC_DEFAULT : args.async === true);
+const watchCommand = (sessionId) => `node "${WATCH_SCRIPT}" ${sessionId}`;
+// Claude Code hands the model a result's structuredContent, not its text: the guidance rides there too.
+const waitFields = (sessionId) => ({
+  watch: watchCommand(sessionId),
+  howToWait: 'Run `watch` as a background task (Bash, run_in_background: true): its output is the turn live and it exits with the final answer, notifying you once. Keep working meanwhile. Do not call zcode_session_wait: it blocks this session.',
+});
+function backgroundHint(sessionId) {
+  return [
+    'ZCode is working on it in the background. Do not wait with zcode_session_wait: it blocks this whole session.',
+    'To be told when the turn ends and keep working meanwhile, start this as a background task (Bash with run_in_background: true):',
+    `  ${watchCommand(sessionId)}`,
+    'Its output is the turn live (text and each tool step), and it exits with the full final answer: you get one notification then, and read the answer from that output.',
+    'For a notification per tool step instead, run the same command with --events through the Monitor tool.',
+    'Peek without waiting: zcode_session_output. Cancel: zcode_session_cancel.',
+  ].join('\n');
+}
+const ASYNC_PARAM = `Return at once with {sessionId, turnId, status:"running"} instead of holding the call for the whole turn (default ${ASYNC_DEFAULT}). The result names a background watcher command to wait with.`;
+const SERVER_INSTRUCTIONS = [
+  'ZCode turns take minutes. Never hold this session on one.',
+  `Start them with async (${ASYNC_DEFAULT ? 'the default here' : 'async: true'}) on zcode_agent, zcode_session_start or zcode_session_send, then wait in the background:`,
+  `Bash with run_in_background: true running \`node "${WATCH_SCRIPT}" <sessionId>\`. That task's output is the turn live; it exits with the final answer and you are notified once. Keep working meanwhile.`,
+  'Use the Monitor tool with the same command plus --events only when you need to react to each tool step.',
+  'Do not call zcode_session_wait with a long timeout_s: it blocks the session for the whole turn.',
+].join(' ');
+
 const TOOLS = [
   {
     name: 'zcode_agent',
-    description: 'Run a one-shot agent turn in the ZCode harness (full tool access: files, shell, MCP plugins). Returns the final answer text after all internal tool use completes. May take minutes for complex tasks.',
+    description: `Run a one-shot agent turn in the ZCode harness (full tool access: files, shell, MCP plugins). May take minutes. ${ASYNC_DEFAULT ? 'Returns at once and runs in the background (async defaults to true here): wait with the background watcher command the result names.' : 'Without async it returns the final answer once all internal tool use completes; with async:true it returns at once and names a background watcher command to wait with.'}`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -116,39 +149,39 @@ const TOOLS = [
         workspace: { type: 'string', description: 'Optional absolute directory the agent works in (default: the bridge workspace).' },
         reasoning_level: { type: 'string', enum: ['low', 'high', 'max'], description: 'Reasoning effort (default high).' },
         model: { type: 'string', description: 'Optional model override for this call only, e.g. "GLM-5.3" (see zcode_models).' },
-        async: { type: 'boolean', description: 'Return immediately with {sessionId, turnId, status:"running"} instead of waiting for the turn. Then poll zcode_session_wait / zcode_session_output, or zcode_session_cancel.' },
+        async: { type: 'boolean', description: ASYNC_PARAM },
       },
       required: ['prompt'],
     },
   },
   {
     name: 'zcode_session_start',
-    description: 'Create a persistent ZCode harness session (optionally with an opening prompt) for multi-turn orchestration. Returns the sessionId. With async:true and an initial_prompt it returns {sessionId, turnId, status:"running"} immediately.',
+    description: 'Create a persistent ZCode harness session (optionally with an opening prompt) for multi-turn orchestration. Returns the sessionId; with an initial_prompt run async, also the turnId and a background watcher command to wait with.',
     inputSchema: {
       type: 'object',
       properties: {
         initial_prompt: { type: 'string', description: 'Optional first prompt; if omitted the session starts idle.' },
         workspace: { type: 'string' },
-        async: { type: 'boolean', description: 'Start the opening prompt without waiting; poll with zcode_session_wait.' },
+        async: { type: 'boolean', description: ASYNC_PARAM },
       },
     },
   },
   {
     name: 'zcode_session_send',
-    description: 'Send a follow-up prompt to a session created by zcode_session_start and wait for the turn to finish. Emits progress notifications with the latest output. With async:true returns {sessionId, turnId, status:"running"} immediately.',
+    description: 'Send a follow-up prompt to a session created by zcode_session_start. Run async, it returns at once with the turnId and a background watcher command to wait with; otherwise it holds the call until the turn finishes.',
     inputSchema: {
       type: 'object',
       properties: {
         session_id: { type: 'string' },
         prompt: { type: 'string' },
-        async: { type: 'boolean', description: 'Start the turn without waiting; poll with zcode_session_wait.' },
+        async: { type: 'boolean', description: ASYNC_PARAM },
       },
       required: ['session_id', 'prompt'],
     },
   },
   {
     name: 'zcode_session_wait',
-    description: 'Wait for the current turn on a session to finish (use after an async zcode_agent / zcode_session_start / zcode_session_send). Blocks up to timeout_s; returns {status: running|done|error|cancelled (idle if no turn ever ran), finalText when done, lastOutput, usage, model}. Call repeatedly until status is no longer "running".',
+    description: 'BLOCKS the calling session for up to timeout_s: prefer the background watcher command an async start returns (Bash run_in_background), which notifies you when the turn ends while you keep working. Use this with timeout_s 0 to read a finished turn\'s result at once. Returns {status: running|done|error|cancelled (idle if no turn ever ran), finalText when done, lastOutput, usage, model}.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -346,10 +379,10 @@ async function handleToolCall(params) {
       reasoningLevel: args.reasoning_level,
       ...(modelSel ? { model: modelSel } : {}),
     });
-    if (args.async === true) {
+    if (asyncOf(args)) {
       const started = mgr().startTurn(sessionId, String(args.prompt || ''), {});
-      const text = `sessionId: ${sessionId}\nturnId: ${started.turnId}\nstatus: running\n\nPoll with zcode_session_wait { "session_id": "${sessionId}" }, peek with zcode_session_output, cancel with zcode_session_cancel.`;
-      return toolResult(text, { structuredContent: { sessionId, turnId: started.turnId, status: 'running', model } });
+      const text = `sessionId: ${sessionId}\nturnId: ${started.turnId}\nstatus: running\nmodel: ${model.providerId}/${model.modelId}\n\n${backgroundHint(sessionId)}`;
+      return toolResult(text, { structuredContent: { sessionId, turnId: started.turnId, status: 'running', model, ...waitFields(sessionId) } });
     }
     try {
       const result = await mgr().runTurn(sessionId, String(args.prompt || ''), {
@@ -369,9 +402,9 @@ async function handleToolCall(params) {
   if (name === 'zcode_session_start') {
     const created = await mgr().createSession({ workspacePath: args.workspace });
     if (args.initial_prompt) {
-      if (args.async === true) {
+      if (asyncOf(args)) {
         const started = mgr().startTurn(created.sessionId, String(args.initial_prompt), {});
-        return toolResult(`sessionId: ${created.sessionId}\nturnId: ${started.turnId}\nstatus: running`, { structuredContent: { sessionId: created.sessionId, turnId: started.turnId, status: 'running', model: created.model } });
+        return toolResult(`sessionId: ${created.sessionId}\nturnId: ${started.turnId}\nstatus: running\n\n${backgroundHint(created.sessionId)}`, { structuredContent: { sessionId: created.sessionId, turnId: started.turnId, status: 'running', model: created.model, ...waitFields(created.sessionId) } });
       }
       progress(token, 'running opening prompt…');
       const result = await mgr().runTurn(created.sessionId, String(args.initial_prompt), {
@@ -385,9 +418,9 @@ async function handleToolCall(params) {
   if (name === 'zcode_session_send') {
     const info = mgr().sessionInfo(String(args.session_id || ''));
     if (!info) return toolError(`unknown session ${args.session_id} (start one with zcode_session_start, or recover it with zcode_sessions_list)`);
-    if (args.async === true) {
+    if (asyncOf(args)) {
       const started = mgr().startTurn(String(args.session_id), String(args.prompt || ''), {});
-      return toolResult(`sessionId: ${args.session_id}\nturnId: ${started.turnId}\nstatus: running`, { structuredContent: started });
+      return toolResult(`sessionId: ${args.session_id}\nturnId: ${started.turnId}\nstatus: running\n\n${backgroundHint(String(args.session_id))}`, { structuredContent: Object.assign({}, started, waitFields(String(args.session_id))) });
     }
     const result = await mgr().runTurn(String(args.session_id), String(args.prompt || ''), {
       onDelta: (d) => { if (d.type === 'text') progress(token, d.text.slice(-300)); },
@@ -596,6 +629,18 @@ process.stdin.on('data', (d) => {
 });
 process.stdin.on('end', () => { log('stdin closed, exiting'); shutdown(); });
 
+// What the client declared (initialize) and sent along with its last tools/call (_meta), for diagnosing
+// what it supports: out/mcp-client.json. Capabilities and metadata keys only, never arguments.
+const CLIENT_FILE = path.join(__dirname, 'out', 'mcp-client.json');
+const clientSeen = { initialize: null, lastCallMeta: null };
+function recordClient(key, value) {
+  clientSeen[key] = value;
+  try {
+    fs.mkdirSync(path.dirname(CLIENT_FILE), { recursive: true });
+    fs.writeFileSync(CLIENT_FILE, `${JSON.stringify(clientSeen, null, 2)}\n`);
+  } catch { /* diagnostics only */ }
+}
+
 let initialized = false;
 async function dispatch(msg) {
   if (!msg || typeof msg !== 'object') return;
@@ -605,12 +650,15 @@ async function dispatch(msg) {
     return;
   }
   if (msg.method === 'initialize') {
+    const p = msg.params || {};
+    recordClient('initialize', { at: new Date().toISOString(), protocolVersion: p.protocolVersion, capabilities: p.capabilities, clientInfo: p.clientInfo, metaKeys: Object.keys(p._meta || {}) });
     const clientProto = msg.params && msg.params.protocolVersion;
     const protocolVersion = clientProto || SUPPORTED_PROTOCOL;
     return reply(msg.id, {
       protocolVersion,
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: 'zcode-bridge', version: '0.5.2', title: 'ZCode harness bridge' },
+      instructions: SERVER_INSTRUCTIONS,
     });
   }
   if (msg.method === 'ping') return reply(msg.id, {});
@@ -618,6 +666,8 @@ async function dispatch(msg) {
     return reply(msg.id, { tools: TOOLS });
   }
   if (msg.method === 'tools/call') {
+    const meta = (msg.params && msg.params._meta) || {};
+    recordClient('lastCallMeta', { at: new Date().toISOString(), tool: msg.params && msg.params.name, meta: Object.fromEntries(Object.entries(meta).filter(([k]) => /capabilit|protocolVersion|progressToken/i.test(k))), keys: Object.keys(meta) });
     try {
       const result = await handleToolCall(msg.params);
       return reply(msg.id, result);
