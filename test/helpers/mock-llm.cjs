@@ -64,7 +64,15 @@ function createMockLlm({ log = () => {} } = {}) {
       const fn = bashTool(json.tools);
       const id = `chatcmpl-mock-${++seq}`;
       const created = Math.floor(Date.now() / 1000);
-      const entry = { at: Date.now(), roles: messages.map((m) => m.role), lastUser, afterTool: lastToolIdx > lastUserIdx, stream: json.stream !== false };
+      const entry = {
+        at: Date.now(),
+        roles: messages.map((m) => m.role),
+        lastUser,
+        // every user/assistant text the model was given, in order: what history it saw
+        history: messages.filter((m) => m.role === 'user' || m.role === 'assistant').map((m) => `${m.role}: ${textOf(m.content)}`),
+        afterTool: lastToolIdx > lastUserIdx,
+        stream: json.stream !== false,
+      };
       let reply;
       if (toolMatch && lastToolIdx < lastUserIdx && fn) {
         const seconds = Number(toolMatch[1]);

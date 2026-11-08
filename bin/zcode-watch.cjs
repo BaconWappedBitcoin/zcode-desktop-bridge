@@ -29,7 +29,9 @@ const option = (name) => {
   const at = args.indexOf(name);
   return at >= 0 ? args[at + 1] : undefined;
 };
-const sessionId = args.find((a, i) => !a.startsWith('--') && !['--turn', '--status-dir', '--max-minutes'].includes(args[i - 1]));
+const sessionId = args.find((a, i) => !a.startsWith('--') && !['--turn', '--status-dir', '--max-minutes', '--wait-start'].includes(args[i - 1]));
+// --wait-start <s>: the session's turn is about to start (a message just woke it): wait for it, then follow it
+const waitStartMs = (Number(option('--wait-start')) || 0) * 1000;
 const eventsOnly = flag('--events');
 const maxMs = (Number(option('--max-minutes')) || 24 * 60) * 60000;
 
@@ -109,6 +111,20 @@ async function watchStore(store) {
   try { mailbox = require('../lib/zcode-mailbox.cjs'); } catch { mailbox = null; }
   let entry = store.getSession(sessionId);
   out(`zcode-watch: session ${sessionId} (${entry.source}${entry.title ? `, "${oneLine(entry.title, 60)}"` : ''}, ${entry.model || '?'}) is ${entry.state}; following it from ZCode's store, in ${entry.workspace || '?'}\n`);
+  if (waitStartMs && entry.state !== 'running') {
+    const before = entry.prompt ? entry.prompt.id : null;
+    out(`zcode-watch: waiting up to ${Math.round(waitStartMs / 1000)} s for its turn to start\n`);
+    const until = Date.now() + waitStartMs;
+    for (;;) {
+      await sleep(1000);
+      entry = store.getSession(sessionId) || entry;
+      if (entry.state === 'running' || (entry.prompt && entry.prompt.id !== before)) break;
+      if (Date.now() > until) {
+        out(`zcode-watch: no turn started within ${Math.round(waitStartMs / 1000)} s\n`);
+        process.exit(4);
+      }
+    }
+  }
   const t0 = Date.now();
   let promptId = null;
   const seen = new Map(); // part id -> {len} | {status}

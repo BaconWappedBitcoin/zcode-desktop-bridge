@@ -468,7 +468,29 @@ function storeView(entry, { tailLines = 25 } = {}) {
 // next prompt; it reads the mailbox only when it runs with ZCODE_MESSAGE_ENABLED=1.
 const mailbox = require('./lib/zcode-mailbox.cjs');
 const v4words = require('./lib/v4-commands.cjs');
-const READ_ONLY_NOTE = 'It runs in the ZCode app, which holds it. From here: watch and read it (zcode_session_attach, zcode_session_output, the watch command) and send to it with zcode_session_send (steer or queue), delivered through ZCode\'s session mailbox at its next tool step, or with its next prompt when it is idle (the app must run with ZCODE_MESSAGE_ENABLED=1). Stop it or change its model in the app.';
+// A session with no turn running is woken instead (lib/zcode-wake.cjs): through the ZCode app's scheduler
+// when the app runs (the app runs the turn itself, so its loaded copy stays whole), with the ZCode CLI when
+// it does not. Settled wakes are cleaned up: by this process for its own, and at startup for any left.
+const wake = require('./lib/zcode-wake.cjs');
+const harnessEnv = require('./lib/harness-env.cjs');
+const pendingWakes = new Set();
+let wakeTimer = null;
+function trackWake(automationId) {
+  pendingWakes.add(automationId);
+  if (wakeTimer) return;
+  wakeTimer = setInterval(() => {
+    for (const id of [...pendingWakes]) {
+      try {
+        const st = wake.wakeState(id);
+        if (wake.settled(st)) { if (st.state === 'gone' || wake.cleanup(id)) pendingWakes.delete(id); }
+      } catch { /* the app holds a lock: next round */ }
+    }
+    if (!pendingWakes.size) { clearInterval(wakeTimer); wakeTimer = null; }
+  }, 15000);
+  if (wakeTimer.unref) wakeTimer.unref();
+}
+setTimeout(() => { try { wake.sweep(); } catch { /* no task index */ } }, 5000).unref();
+const READ_ONLY_NOTE = 'It runs in the ZCode app, which holds it. From here: watch and read it (zcode_session_attach, zcode_session_output, the watch command) and send to it with zcode_session_send: while a turn runs, through ZCode\'s session mailbox (a steer at its next tool step; the app must run with ZCODE_MESSAGE_ENABLED=1); with no turn running, the message starts one (through the app\'s scheduler, or the ZCode CLI when the app is closed). Stop it or change its model in the app.';
 const QUEUE_PREFIX = 'Queued for when you have finished your current task (do not drop what you are doing for it):\n\n';
 const MAILBOX_OFF = 'The ZCode app reads the mailbox only when it runs with ZCODE_MESSAGE_ENABLED=1: set it as a user environment variable, quit ZCode fully (its tray icon too) and start it again.';
 
@@ -503,6 +525,28 @@ function routeStore(name, sid, args = {}) {
     if (delivery === 'startNow') return toolError(`${sid} runs in the ZCode app. The bridge reaches it through ZCode's session mailbox, which delivers at tool steps, so it cannot interrupt the turn from here: stop it in the app, or send with delivery "steer" or "queue".`);
     const text = String(args.prompt || '');
     if (!text.trim()) return toolError('prompt is empty');
+    if (entry.state !== 'running' && cfg.wakeIdleSessions !== false && process.env.ZCODE_BRIDGE_WAKE !== '0') {
+      // nothing runs in it: start a turn with the message
+      const header = `${sid} (${entry.source}, "${String(entry.title || '').slice(0, 60)}") had no turn running`;
+      const watchStart = `${watchCommand(sid)} --wait-start 120`;
+      try {
+        if (wake.taskOf(sid) && wake.appRunning()) {
+          const w = wake.wake(sid, text);
+          trackWake(w.automationId);
+          const view = { sessionId: sid, status: 'sent', via: 'app-scheduler', delivery: 'turn', wakeId: w.automationId, model: w.model, state: entry.state, owner: entry.source, watch: watchStart, note: 'The ZCode app\'s scheduler starts the message as a turn in that session within ~20 s: the app runs it, so it shows there live and the app\'s copy of the session stays whole. The bridge removes the one-off scheduled task it used once the turn has run. zcode_session_queue shows it until it starts (delete takes it back).' };
+          return toolResult(`${header}: the message starts a turn in it through the ZCode app's scheduler (within ~20 s, on ${w.model}). ${view.note}\nFollow it live: ${watchStart}`, { structuredContent: view });
+        }
+        if (!wake.appRunning()) {
+          const located = harnessEnv.locateHarness(cfg);
+          const run = wake.wakeByCli(sid, text, { harness: { exe: located.exe, bundle: located.bundle, env: harnessEnv.providerRuntimeEnv(located.bundle) }, cwd: entry.workspace || undefined, log });
+          const view = { sessionId: sid, status: 'sent', via: 'cli', delivery: 'turn', pid: run.pid, state: entry.state, owner: entry.source, watch: watchStart, note: 'The ZCode app is not running, so nothing holds the session: the ZCode CLI runs the message as a turn in it (in the background, resumed from ZCode\'s store). The app shows it when it next opens the session.' };
+          return toolResult(`${header}: the ZCode CLI runs the message as a turn in it now (pid ${run.pid}). ${view.note}\nFollow it live: ${watchStart}`, { structuredContent: view });
+        }
+      } catch (e) {
+        return toolError(`${header}, and starting a turn failed: ${e.message}`);
+      }
+      // the app runs but does not list it (a session of the CLI): leave it in its mailbox
+    }
     let sent;
     try { sent = mailbox.send(sid, delivery === 'queue' ? QUEUE_PREFIX + text : text); } catch (e) { return toolError(e.message); }
     const pendingList = mailboxPending(sid, entry);
@@ -516,15 +560,25 @@ function routeStore(name, sid, args = {}) {
   if (name === 'zcode_session_queue') {
     const action = String(args.action || 'list');
     if (action === 'delete') {
-      if (!args.queue_item_id) return toolError('queue_item_id (a mailbox messageId from action "list") is required for delete');
-      const taken = mailbox.cancel(sid, String(args.queue_item_id));
-      if (!taken) return toolError(`${args.queue_item_id} is no longer waiting: the session already took it (or it never existed)`);
+      if (!args.queue_item_id) return toolError('queue_item_id (a mailbox messageId or a wakeId from action "list") is required for delete');
+      const id = String(args.queue_item_id);
+      if (id.startsWith('automation-')) {
+        const st = wake.wakeState(id);
+        if (st.state !== 'pending') return toolError(`${id} is no longer waiting: the app's scheduler already started it (${st.state})`);
+        wake.cleanup(id);
+        pendingWakes.delete(id);
+      } else {
+        const taken = mailbox.cancel(sid, id);
+        if (!taken) return toolError(`${id} is no longer waiting: the session already took it (or it never existed)`);
+      }
     } else if (action !== 'list') {
       return toolError(`${sid} runs in the ZCode app: from here its mailbox messages can be listed and taken back (delete) before the session reads them; edit, reorder or run the app's own queue in the app.`);
     }
     const pendingList = mailboxPending(sid, entry);
+    const wakes = wake.listWakes().filter((w) => w.sessionId === sid && !wake.settled(w)).map((w) => ({ wakeId: w.automationId, state: w.state, ...(w.error ? { error: w.error } : {}) }));
     const view = {
       sessionId: sid, owner: entry.source, state: entry.state,
+      ...(wakes.length ? { wakes } : {}),
       mailbox: pendingList,
       recentlyTaken: mailbox.delivered(sid, 5).map((m) => ({ messageId: m.messageId, readAt: m.readAt, text: m.content.startsWith(QUEUE_PREFIX) ? m.content.slice(QUEUE_PREFIX.length) : m.content })),
       appQueue: zstore.pendingInputs(sid),
@@ -533,6 +587,7 @@ function routeStore(name, sid, args = {}) {
     const hint = mailboxHint(pendingList);
     const lines = [
       `${sid} (${entry.source}, ${entry.state}): ${pendingList.length ? `${pendingList.length} mailbox message(s) not taken yet` : 'no mailbox message waiting'}${view.appQueue.length ? `; ${view.appQueue.length} in the app's own queue` : ''}${action === 'delete' ? ' (delete done)' : ''}`,
+      ...wakes.map((w) => `   wake ${w.wakeId}: ${w.state === 'pending' ? 'waiting for the app\'s scheduler' : w.state}${w.error ? ` — ${w.error}` : ''}`),
       ...pendingList.map((m, i) => `${i + 1}. ${m.messageId} [${m.delivery}${m.stuck ? ', not picked up' : ''}] ${m.text.replace(/\s+/g, ' ').slice(0, 160)}`),
       ...view.appQueue.map((q) => `   app queue: [${q.delivery}] ${q.text.replace(/\s+/g, ' ').slice(0, 160)}`),
       ...view.recentlyTaken.map((m) => `   taken ${m.readAt || ''}: ${m.text.replace(/\s+/g, ' ').slice(0, 120)}`),

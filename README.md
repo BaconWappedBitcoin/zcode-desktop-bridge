@@ -371,7 +371,11 @@ A message for a session whose turn is running goes in the way ZCode delivers it 
 
 **Sessions of a bridge** use ZCode's V4 conversation protocol over the bridge's own app-server (`lib/v4-commands.cjs`): `v4/command` `sendText` with `requestedDelivery` `guide` / `queue` / `startNow`, the queue commands (compare-and-set on the session revision), and `v4/conversation/subscribe` frames for the revision, phase and queue. ZCode drains its queue by itself after turns started through V4; after a turn the bridge started with `session/send` it re-arms the drain (`setAutoDrain`). Turns that ZCode starts by itself (a queued message, an interrupt) are followed like the bridge's own: live stream, `zcode_session_wait`, final answer.
 
-**Sessions the ZCode app holds** are reached through **ZCode's session mailbox** (`lib/zcode-mailbox.cjs`), the app's own channel for messages between sessions: the bridge leaves the message in `~/.zcode/mailbox/<sessionId>/unread/` (written atomically), and the app's runtime takes it at that session's next tool step (a real steer of the running turn), before a turn ends (the turn goes on), or with the next prompt. Nothing wakes an idle session: a message for one waits for its next prompt. `delivery: "queue"` adds a line asking the agent to finish its current task first (the mailbox has no separate queue); `interrupt` is not possible this way. `zcode_session_queue` lists the mailbox messages still waiting and those taken, plus the app's own queue, and takes back a message not taken yet (`delete`).
+**Sessions the ZCode app holds**, with a turn running, are reached through **ZCode's session mailbox** (`lib/zcode-mailbox.cjs`), the app's own channel for messages between sessions: the bridge leaves the message in `~/.zcode/mailbox/<sessionId>/unread/` (written atomically), and the app's runtime takes it at that session's next tool step (a real steer of the running turn), or before the turn ends (the turn goes on). `delivery: "queue"` adds a line asking the agent to finish its current task first (the mailbox has no separate queue); `interrupt` is not possible this way.
+
+**With no turn running**, the message **starts one** (`lib/zcode-wake.cjs`). The mailbox cannot do that (it is read only at a turn's tool steps, its end, or a new prompt), and a turn run by another runtime is no answer either: the app keeps the sessions it has open loaded in its own runtime, and a turn the ZCode CLI (`zcode --resume <id> -p …`) or a bridge runs on such a session lands in the store while the app's loaded copy never sees it — its next turn goes on without it (measured: the CLI's turn was missing from the history of the holder's next model call). So the bridge has the **app run the turn itself**, through its own scheduler: it writes one one-off scheduled task targeting the session (the session's own model, reasoning level, mode and workspace, due now) into `~/.zcode/v2/tasks-index.sqlite`; the app's scheduler, which polls that table every 20 s, claims it and its host resumes the session and sends the message in it — live in the app, the session's history whole. Once the run has settled, the bridge removes that scheduled task and its run rows and clears the scheduled-task mark the app puts on the session (`tasks.cron_automation_id`), so only the turn remains. When the ZCode app is not running, nothing holds the session, and the **ZCode CLI** runs the turn in the background instead. The watch command it returns (`--wait-start`) waits for the turn and follows it. `wakeIdleSessions: false` (or env `ZCODE_BRIDGE_WAKE=0`) leaves such messages in the mailbox instead, for the session's next prompt.
+
+`zcode_session_queue` lists, for a session the app holds, the wakes not started yet, the mailbox messages still waiting and those taken, and the app's own queue; `delete` takes back a wake or a message not taken yet.
 
 The app reads the mailbox only when it runs with **`ZCODE_MESSAGE_ENABLED=1`**, read when it starts. Set it once as a user environment variable, then quit ZCode fully (it keeps running in the tray) and start it again:
 
@@ -442,6 +446,7 @@ Copy `config.example.json` → `config.json`:
 | `statusDir` | `<repo>/out/sessions/` | on-disk session status files (see "On-disk session status") |
 | `bridgesDir` | `<repo>/out/bridges/` | the registry of live bridge processes (see "Sessions across clients") |
 | `sessionMailbox` | `true` | start the bridge's app-server with ZCode's session mailbox on (`ZCODE_MESSAGE_ENABLED=1`), so its sessions take messages left for them (see "Talking to a running session") |
+| `wakeIdleSessions` | `true` | a message for a ZCode app session with no turn running starts one (through the app's scheduler, or the ZCode CLI when the app is closed); `false`: it waits in the session's mailbox for its next prompt (env `ZCODE_BRIDGE_WAKE=0` does the same) |
 | `offpeakDir` | `<repo>/out/offpeak/` | on-disk idle-time task files (see "On-disk idle-time task status") |
 | `offersPollMs` | `600000` | offer-detector poll interval; `0` disables polling (see "Offer notifications") |
 | `offerToasts` | `true` | raise a Windows toast on new claimable offers |
@@ -490,6 +495,7 @@ node test/bridge-registry.cjs  # the registry of bridge processes: live/dead own
 node test/two-bridges.cjs      # LIVE: two bridge processes; list, attach, forwarded output/send/wait, then take-over after the owner exits (3 short model turns)
 node test/v4-commands.cjs      # V4 pieces: delivery names, compare-and-set envelopes, frames into session state, fragment assembly, queue summary (7 checks, no harness)
 node test/steer-queue.cjs      # LIVE (harness, no credits: a scripted mock model, test/helpers/mock-llm.cjs): steer, queue + drain, edit/delete, stop holds the queue, resume, interrupt, and the mailbox into a session another process holds (26 checks)
+node test/zcode-wake.cjs       # waking an idle app session: the one-off scheduled task, its states, cleanup, the app's limit of 20, the session's own model (7 checks, temp task index — no app)
 ```
 
 ## Project layout
@@ -509,6 +515,7 @@ lib/session-status.cjs    on-disk session status (atomic <id>.json + <id>.log ND
 lib/v4-commands.cjs       V4 conversation commands (steer/queue/interrupt, queue edits) and frame state
 lib/zcode-store.cjs       read-only view of ZCode's own session store (the app's sessions)
 lib/zcode-mailbox.cjs     ZCode's session mailbox: messages for sessions the app holds
+lib/zcode-wake.cjs        start a turn in an idle app session: the app's scheduler, or the CLI
 lib/bridge-registry.cjs   live bridge processes and their control endpoints
 bin/zcode-watch.cjs       follow a turn live (bridge stream files, or ZCode's store), exit at its end
 lib/coding-plan.cjs       plan quota windows + banked resets (Z.ai backend)

@@ -76,7 +76,9 @@ function bridge(env, configFile) {
     offersPollMs: 0,
   }, null, 2));
   const mailboxRoot = path.join(dir, 'mailbox');
-  const b = bridge({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: providerFile, ZCODE_MAILBOX_ROOT: mailboxRoot }, configFile);
+  // ZCODE_BRIDGE_WAKE=0: a message for the stand-in app session while it is idle stays in its mailbox (the
+  // real ZCode app's scheduler, or the CLI, would otherwise start a turn with it; see test/zcode-wake.cjs)
+  const b = bridge({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: providerFile, ZCODE_MAILBOX_ROOT: mailboxRoot, ZCODE_BRIDGE_WAKE: '0' }, configFile);
   let app = null;
   const saw = (needle) => mock.requests.some((r) => r.lastUser.includes(needle));
   const until = async (pred, ms, label) => {
