@@ -175,10 +175,15 @@ function bridge(env, configFile) {
     const steerAt = mock.requests.findIndex((r) => r.lastUser.includes('MAILBOX-STEER from claude'));
     const appToolAt = mock.requests.findIndex((r) => r.lastUser.includes('MOCK:TOOL:10 app turn') && r.reply && r.reply.tool);
     check(steerAt > appToolAt && appToolAt >= 0 && /session-message source="mailbox"/.test(mock.requests[steerAt].lastUser), 'it arrived after the tool step, as a session message');
+    check(/\[From Claude: a Claude Code session[^\]]*write it in your reply/.test(mock.requests[steerAt].lastUser), 'it starts with the header saying who sent it and how to answer', mock.requests[steerAt].lastUser.slice(0, 400));
     const takenView = await b.call('zcode_session_queue', { session_id: appSid });
     check(!(takenView.s.mailbox || []).length && (takenView.s.recentlyTaken || []).some((m) => m.text === 'MAILBOX-STEER from claude'), 'the queue view then shows it taken', takenView.text);
     const noInterrupt = await b.call('zcode_session_send', { session_id: appSid, prompt: 'x', delivery: 'interrupt' });
     check(noInterrupt.isError, 'interrupt is refused for a session the bridge reaches only by mailbox', noInterrupt.text);
+    const camel = await b.call('zcode_session_status', { sessionId: appSid });
+    check(!camel.isError && camel.s.sessionId === appSid, 'arguments are taken under their camelCase names too (sessionId)', camel.text.slice(0, 200));
+    const missing = await b.call('zcode_session_output', {});
+    check(missing.isError && /needs session_id/.test(missing.text), 'a missing session_id is named, not reported as an unknown session', missing.text);
     await appTurn;
     const later = await b.call('zcode_session_send', { session_id: appSid, prompt: 'TAKE-BACK me', delivery: 'queue' });
     const back = await b.call('zcode_session_queue', { session_id: appSid, action: 'delete', queue_item_id: later.s.messageId });

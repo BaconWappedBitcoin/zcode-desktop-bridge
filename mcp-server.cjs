@@ -178,7 +178,7 @@ const TOOLS = [
   },
   {
     name: 'zcode_session_send',
-    description: 'Send a prompt to a ZCode session (a bridge\'s, or one the ZCode app holds). Idle: it runs as the next turn (run async, the call returns at once with the turnId and a background watcher command to wait with; otherwise it holds the call until the turn finishes); an idle ZCode app session is started by the app itself. A turn running: the message goes into that session the way ZCode delivers it, chosen by delivery: "steer" reaches the agent inside the running turn after its current tool step; "queue" runs as its own turn once the current one ends (queued messages run in order); "interrupt" stops the running turn and starts a new one with this message (bridge sessions only). Default: steer for a bridge\'s session; queue for a ZCode app session, where a steer can only arrive as a session message the agent sees as "for reference only" and may decline, while a queued message is a real prompt it acts on. The call returns at once; the live stream (watch command) shows the steer arriving and queued turns running.',
+    description: 'Send a prompt to a ZCode session (a bridge\'s, or one the ZCode app holds). Idle: it runs as the next turn (run async, the call returns at once with the turnId and a background watcher command to wait with; otherwise it holds the call until the turn finishes); an idle ZCode app session is started by the app itself. A turn running: the message goes into that session the way ZCode delivers it, chosen by delivery: "steer" reaches the agent inside the running turn after its current tool step; "queue" runs as its own turn once the current one ends (queued messages run in order); "interrupt" stops the running turn and starts a new one with this message (bridge sessions only). Default: steer for a bridge\'s session; queue for a ZCode app session, where a steer can only arrive as a session message the agent sees as "for reference only" and may decline, while a queued message is a real prompt it acts on. A message for a ZCode app session starts with a short header saying it comes from Claude through the bridge and that the agent answers simply in its reply (Claude reads the session); write the message itself as to a colleague. The call returns at once; the live stream (watch command) shows the steer arriving and queued turns running.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -448,17 +448,19 @@ function forwardTimeoutMs(name, args) {
 // Sessions no bridge started (the ZCode app's, the CLI's): read from ZCode's own store, read-only. Another
 // process (the app) holds them, so from here they can be watched and read, not driven.
 const zstore = require('./lib/zcode-store.cjs');
+const waitingText = (w) => `waiting for an answer in the ZCode app (${w.tool}${w.question ? `: ${w.question}` : ''}); nothing sent from here answers it`;
 function storeView(entry, { tailLines = 25 } = {}) {
   const tail = zstore.turnText(entry.sessionId, { maxLines: tailLines });
   return {
     sessionId: entry.sessionId,
     state: entry.state,
+    ...(entry.waiting ? { waiting: waitingText(entry.waiting) } : {}),
     owner: entry.source,
     title: entry.title,
     workspace: entry.workspace,
     model: entry.model,
     lastActivity: entry.lastActivity ? new Date(entry.lastActivity).toISOString() : null,
-    lastLine: lastLine(tail).slice(0, 200),
+    lastLine: entry.waiting ? waitingText(entry.waiting).slice(0, 200) : lastLine(tail).slice(0, 200),
     ...(entry.state === 'running' ? { watch: watchCommand(entry.sessionId) } : {}),
     tail,
   };
@@ -493,6 +495,19 @@ setTimeout(() => {
 }, 5000).unref();
 const READ_ONLY_NOTE = 'It runs in the ZCode app, which holds it. From here: watch and read it (zcode_session_attach, zcode_session_output, the watch command) and send to it with zcode_session_send: while a turn runs, through ZCode\'s session mailbox (a steer at its next tool step; the app must run with ZCODE_MESSAGE_ENABLED=1); with no turn running, the message starts one (through the app\'s scheduler, or the ZCode CLI when the app is closed). Stop it or change its model in the app.';
 const QUEUE_PREFIX = 'Queued for when you have finished your current task (do not drop what you are doing for it):\n\n';
+// Who sent a message into a ZCode app session, and how to answer: the agent there has no tool to reach the
+// sender, and does not know that its replies are read. Config messageHeader: a string replaces it, false drops it.
+const DEFAULT_HEADER = '[From Claude: a Claude Code session working with the same user, sent through the zcode-bridge. Claude reads this session\'s replies and tool output through the bridge, so to answer Claude or ask it something, write it in your reply; there is no tool to call for that.]';
+const HEADER = cfg.messageHeader === false ? '' : (typeof cfg.messageHeader === 'string' ? cfg.messageHeader.trim() : DEFAULT_HEADER);
+/** The text delivered into an app session: header, then (queued) the queue line, then the message. */
+const frameMessage = (text, { queued = false } = {}) => `${HEADER ? `${HEADER}\n\n` : ''}${queued ? QUEUE_PREFIX : ''}${text}`;
+/** A delivered text back to {delivery, text}, for the queue view. */
+function unframeMessage(content) {
+  let rest = String(content || '');
+  if (HEADER && rest.startsWith(`${HEADER}\n\n`)) rest = rest.slice(HEADER.length + 2);
+  const queued = rest.startsWith(QUEUE_PREFIX);
+  return { delivery: queued ? 'queue' : 'steer', text: queued ? rest.slice(QUEUE_PREFIX.length) : rest };
+}
 const MAILBOX_OFF = 'The ZCode app reads the mailbox only when it runs with ZCODE_MESSAGE_ENABLED=1: set it as a user environment variable, quit ZCode fully (its tray icon too) and start it again.';
 
 /** Pending mailbox messages of a session, each marked stuck when the session moved on without taking it. */
@@ -500,7 +515,8 @@ function mailboxPending(sid, entry) {
   return mailbox.pending(sid).map((m) => {
     const created = Date.parse(m.createdAt) || 0;
     const stuck = Boolean(entry && entry.state === 'running' && entry.lastActivity && entry.lastActivity > created + 5000);
-    return { messageId: m.messageId, delivery: m.content.startsWith(QUEUE_PREFIX) ? 'queue' : 'steer', text: m.content.startsWith(QUEUE_PREFIX) ? m.content.slice(QUEUE_PREFIX.length) : m.content, createdAt: m.createdAt, ...(stuck ? { stuck: true } : {}) };
+    const { delivery, text } = unframeMessage(m.content);
+    return { messageId: m.messageId, delivery, text, createdAt: m.createdAt, ...(stuck ? { stuck: true } : {}) };
   });
 }
 function mailboxHint(pendingList) {
@@ -531,11 +547,12 @@ function routeStore(name, sid, args = {}) {
     if (!text.trim()) return toolError('prompt is empty');
     // a turn runs and the message is queued: the app's scheduler hands it to the session's own queue, where it
     // runs as a real prompt once the turn ends (a mailbox message reaches the agent as a reference note)
+    const waitNote = entry.waiting ? ` The agent is ${waitingText(entry.waiting)}: the turn goes on, and the message reaches it, only once that is answered there.` : '';
     if (entry.state === 'running' && delivery === 'queue' && appReachable) {
       try {
-        const w = wake.wake(sid, text);
+        const w = wake.wake(sid, frameMessage(text));
         trackWake(w.automationId);
-        const view = { sessionId: sid, status: 'sent', via: 'app-queue', delivery: 'queue', wakeId: w.automationId, state: entry.state, owner: entry.source, watch: watchCommand(sid), note: 'A turn is running: the ZCode app takes the message into the session\'s own queue (through its scheduler, within ~20 s) and runs it as a real prompt as soon as this turn ends.' };
+        const view = { sessionId: sid, status: 'sent', via: 'app-queue', delivery: 'queue', wakeId: w.automationId, state: entry.state, ...(entry.waiting ? { waiting: waitingText(entry.waiting) } : {}), owner: entry.source, watch: watchCommand(sid), note: `A turn is running: the ZCode app takes the message into the session's own queue (through its scheduler, within ~20 s) and runs it as a real prompt as soon as this turn ends.${waitNote}` };
         return toolResult(`Queued for ${sid} (${entry.source}, "${String(entry.title || '').slice(0, 60)}"): ${view.note}\nFollow it live: ${view.watch}`, { structuredContent: view });
       } catch (e) {
         return toolError(`queuing the message for ${sid} through the ZCode app failed: ${e.message}`);
@@ -547,14 +564,14 @@ function routeStore(name, sid, args = {}) {
       const watchStart = `${watchCommand(sid)} --wait-start 120`;
       try {
         if (wake.taskOf(sid) && wake.appRunning()) {
-          const w = wake.wake(sid, text);
+          const w = wake.wake(sid, frameMessage(text));
           trackWake(w.automationId);
           const view = { sessionId: sid, status: 'sent', via: 'app-scheduler', delivery: 'turn', wakeId: w.automationId, model: w.model, state: entry.state, owner: entry.source, watch: watchStart, note: 'The ZCode app\'s scheduler starts the message as a turn in that session within ~20 s: the app runs it, so it shows there live and the app\'s copy of the session stays whole. The bridge removes the one-off scheduled task it used once the turn has run. zcode_session_queue shows it until it starts (delete takes it back).' };
           return toolResult(`${header}: the message starts a turn in it through the ZCode app's scheduler (within ~20 s, on ${w.model}). ${view.note}\nFollow it live: ${watchStart}`, { structuredContent: view });
         }
         if (!wake.appRunning()) {
           const located = harnessEnv.locateHarness(cfg);
-          const run = wake.wakeByCli(sid, text, { harness: { exe: located.exe, bundle: located.bundle, env: harnessEnv.providerRuntimeEnv(located.bundle) }, cwd: entry.workspace || undefined, log });
+          const run = wake.wakeByCli(sid, frameMessage(text), { harness: { exe: located.exe, bundle: located.bundle, env: harnessEnv.providerRuntimeEnv(located.bundle) }, cwd: entry.workspace || undefined, log });
           const view = { sessionId: sid, status: 'sent', via: 'cli', delivery: 'turn', pid: run.pid, state: entry.state, owner: entry.source, watch: watchStart, note: 'The ZCode app is not running, so nothing holds the session: the ZCode CLI runs the message as a turn in it (in the background, resumed from ZCode\'s store). The app shows it when it next opens the session.' };
           return toolResult(`${header}: the ZCode CLI runs the message as a turn in it now (pid ${run.pid}). ${view.note}\nFollow it live: ${watchStart}`, { structuredContent: view });
         }
@@ -564,10 +581,10 @@ function routeStore(name, sid, args = {}) {
       // the app runs but does not list it (a session of the CLI): leave it in its mailbox
     }
     let sent;
-    try { sent = mailbox.send(sid, delivery === 'queue' ? QUEUE_PREFIX + text : text); } catch (e) { return toolError(e.message); }
+    try { sent = mailbox.send(sid, frameMessage(text, { queued: delivery === 'queue' })); } catch (e) { return toolError(e.message); }
     const pendingList = mailboxPending(sid, entry);
     const when = entry.state === 'running'
-      ? 'A turn is running: the message reaches the agent after its current tool step (or, if no tool step comes, before the turn ends). ZCode shows it to the agent as a session message marked "for reference only", which an agent may decline to act on; for an instruction it must follow, send with delivery "queue": it then runs as a real prompt right after this turn.'
+      ? `A turn is running: the message reaches the agent after its current tool step (or, if no tool step comes, before the turn ends). ZCode shows it to the agent as a session message marked "for reference only", which an agent may decline to act on; for an instruction it must follow, send with delivery "queue": it then runs as a real prompt right after this turn.${waitNote}`
       : 'No turn is running: the message arrives with the next prompt given to this session in the app (the mailbox does not wake an idle session).';
     const hint = mailboxHint(pendingList);
     const view = { sessionId: sid, status: 'sent', via: 'mailbox', delivery: delivery === 'queue' ? 'queue' : 'steer', messageId: sent.messageId, state: entry.state, owner: entry.source, pending: pendingList.length, note: [when, 'zcode_session_queue shows whether it was taken.', hint].filter(Boolean).join(' '), ...(entry.state === 'running' ? { watch: watchCommand(sid) } : {}) };
@@ -595,7 +612,7 @@ function routeStore(name, sid, args = {}) {
       sessionId: sid, owner: entry.source, state: entry.state,
       ...(wakes.length ? { wakes } : {}),
       mailbox: pendingList,
-      recentlyTaken: mailbox.delivered(sid, 5).map((m) => ({ messageId: m.messageId, readAt: m.readAt, text: m.content.startsWith(QUEUE_PREFIX) ? m.content.slice(QUEUE_PREFIX.length) : m.content })),
+      recentlyTaken: mailbox.delivered(sid, 5).map((m) => ({ messageId: m.messageId, readAt: m.readAt, text: unframeMessage(m.content).text })),
       appQueue: zstore.pendingInputs(sid),
       ...(action === 'delete' ? { action, done: true } : {}),
     };
@@ -680,9 +697,29 @@ function sessionView(doc, { tailLines = 25 } = {}) {
   };
 }
 
+/**
+ * Take an argument under its camelCase name too (sessionId for session_id, …): the results speak camelCase
+ * (structuredContent.sessionId), and a model that loads tool schemas lazily tends to reuse the name it read.
+ */
+function normalizeArgs(name, args) {
+  const tool = TOOLS.find((t) => t.name === name);
+  const props = (tool && tool.inputSchema && tool.inputSchema.properties) || {};
+  const out = Object.assign({}, args);
+  for (const [key, value] of Object.entries(args)) {
+    if (key in props) continue;
+    const snake = key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+    if (snake in props && out[snake] === undefined) { out[snake] = value; delete out[key]; }
+  }
+  return out;
+}
+
 async function handleToolCall(params) {
   const name = params && params.name;
-  const args = (params && params.arguments) || {};
+  const args = normalizeArgs(name, (params && params.arguments) || {});
+  if (params && params.arguments) params.arguments = args; // forwarded to another bridge as normalized
+  const schema = (TOOLS.find((t) => t.name === name) || {}).inputSchema || {};
+  const missing = (schema.required || []).filter((k) => args[k] === undefined || args[k] === null || args[k] === '');
+  if (missing.length) return toolError(`${name} needs ${missing.join(', ')}${missing.includes('session_id') ? ' (a session id such as sess_…, from zcode_sessions_list)' : ''}`);
   const token = params && params._meta && params._meta.progressToken;
 
   // a session this process does not hold: reach it where it is (a call forwarded here is always local)
