@@ -60,6 +60,13 @@ function loadConfig() {
 const cfg = loadConfig();
 const log = (...a) => process.stderr.write(`[zcode-mcp] ${new Date().toISOString()} ${a.map(x => (typeof x === 'object' ? JSON.stringify(x) : x)).join(' ')}\n`);
 
+// This process among the other bridge processes (lib/bridge-registry.cjs): every session it creates
+// carries this owner id on disk, and other processes reach its sessions through the control endpoint.
+const registry = require('./lib/bridge-registry.cjs');
+const OWNER_ID = registry.newOwnerId();
+cfg.ownerId = OWNER_ID;
+const BRIDGES_DIR = path.resolve(cfg.bridgesDir || path.join(__dirname, 'out', 'bridges'));
+
 let manager = null;
 function mgr() {
   if (!manager) manager = new AgentManager(cfg, log);
@@ -210,12 +217,23 @@ const TOOLS = [
   },
   {
     name: 'zcode_sessions_list',
-    description: 'List every session this bridge process knows plus every session recorded on disk (the statusDir files), with id, workspace, model, status (idle|running|done|error|cancelled), turns, createdAt, lastActivity, pid — the recovery path for a sessionId lost to a client tool timeout.',
-    inputSchema: { type: 'object', properties: {} },
+    description: 'The ZCode sessions of every bridge process: by default the active ones (a turn running, or open in a live bridge, including those another Claude session started), running first. Each has its state (running | idle | done | error | cancelled | lost: its bridge died mid-turn), its owner (this session, another session, gone), workspace, model, last activity, its latest output line, and for a running one the watcher command to follow it live. Any of them can be used from here: zcode_session_attach, zcode_session_send, zcode_session_output and zcode_session_cancel reach a session another Claude session owns, and take over one whose owner is gone. scope "all" lists every session recorded on disk.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['active', 'all'], description: 'active (default): running, open in a live bridge, used in the last 2 h, or lost in the last day; all: every session on disk.' },
+        limit: { type: 'number', description: 'How many to list, newest first (default 20).' },
+      },
+    },
+  },
+  {
+    name: 'zcode_session_attach',
+    description: 'Connect to a ZCode session, wherever it runs: one this Claude session started, one another Claude session started (even mid-turn), or one whose bridge is gone. Returns its state, owner, the live tail of its current turn, and for a running turn the watcher command to follow it in the background (Bash run_in_background). From then on zcode_session_send / zcode_session_output / zcode_session_cancel work on it from here: they go to the bridge that owns it, or take it over (resume it here) when that bridge is gone.',
+    inputSchema: { type: 'object', properties: { session_id: { type: 'string' } }, required: ['session_id'] },
   },
   {
     name: 'zcode_session_status',
-    description: 'Inspect a bridge session (busy, turns, model, age).',
+    description: 'Inspect a ZCode session (busy, turns, model, age), wherever it runs.',
     inputSchema: { type: 'object', properties: { session_id: { type: 'string' } }, required: ['session_id'] },
   },
   {
@@ -362,10 +380,125 @@ const TOOLS = [
 ];
 
 // ---------------------------------------------------------------- handlers
+// ---------------------------------------------------------------- sessions of other bridge processes
+// Each client runs its own bridge process, and a session lives in the one that created it. These tools
+// reach a session wherever it is: in this process; through the control endpoint of the live process that
+// owns it; or, when that process is gone, from disk (read-only questions) or by taking it over here
+// (session/resume) for a follow-up.
+const FORWARDABLE = new Set(['zcode_session_send', 'zcode_session_wait', 'zcode_session_output', 'zcode_session_cancel', 'zcode_session_status', 'zcode_session_stop', 'zcode_model_set']);
+const DAY_MS = 24 * 60 * 60 * 1000;
+const RECENT_MS = 2 * 60 * 60 * 1000;
+
+function statusDocOf(sessionId) {
+  try { return JSON.parse(fs.readFileSync(mgr().status.fileFor(sessionId), 'utf8')); } catch { return null; }
+}
+
+/** Where a session on disk is served: here, by another live bridge, by an older bridge with no control endpoint, or nowhere. */
+function ownerOf(doc) {
+  if (!doc) return { kind: 'unknown' };
+  if (doc.owner && doc.owner === OWNER_ID) return { kind: 'here' };
+  if (doc.owner) {
+    const entry = registry.lookup(BRIDGES_DIR, doc.owner);
+    return entry ? { kind: 'other', entry } : { kind: 'gone' };
+  }
+  return registry.alive(doc.pid) && doc.pid !== process.pid ? { kind: 'unreachable' } : { kind: 'gone' };
+}
+const OWNER_LABEL = { here: 'this Claude session', other: 'another Claude session', unreachable: 'another bridge (an older version, not reachable)', gone: 'gone (its bridge process exited)', unknown: 'unknown' };
+const stateOf = (doc, owner) => (doc.status === 'running' && owner.kind === 'gone' ? 'lost' : doc.status || 'idle');
+
+/** The current (last) turn of a session's live stream: its last lines. */
+function streamTail(sessionId, maxLines = 25, maxChars = 3000) {
+  let text = '';
+  try { text = fs.readFileSync(mgr().status.streamFileFor(sessionId), 'utf8'); } catch { return ''; }
+  const headers = [...text.matchAll(/── turn \S+ started/g)];
+  const turn = headers.length ? text.slice(headers[headers.length - 1].index) : text;
+  const lines = turn.trimEnd().split('\n');
+  return lines.slice(-maxLines).join('\n').slice(-maxChars);
+}
+const lastLine = (text) => String(text || '').trim().split('\n').filter((l) => l.trim()).pop() || '';
+const finalOf = (sessionId) => {
+  try { return fs.readFileSync(mgr().status.finalFileFor(sessionId), 'utf8'); } catch { return ''; }
+};
+
+function forwardTimeoutMs(name, args) {
+  if (name === 'zcode_session_wait') return Math.min(Math.max(Number(args.timeout_s) || 60, 0), 600) * 1000 + 15000;
+  if (name === 'zcode_session_send') return asyncOf(args) ? 120000 : (cfg.turnTimeoutMs || 900000) + 30000;
+  return 30000;
+}
+
+/** A session tool for a session this process does not hold: forwarded, answered from disk, or adopted. Returns null to go on locally. */
+async function routeRemote(name, args) {
+  const sid = String(args.session_id || '');
+  const doc = statusDocOf(sid);
+  if (!doc) return toolError(`unknown session ${sid} (zcode_sessions_list shows the sessions of every bridge)`);
+  const owner = ownerOf(doc);
+  if (owner.kind === 'other') {
+    try {
+      const result = await registry.call(owner.entry, { name, arguments: args }, forwardTimeoutMs(name, args));
+      if (result && result.structuredContent && typeof result.structuredContent === 'object') result.structuredContent.owner = OWNER_LABEL.other;
+      else if (result && Array.isArray(result.content)) result.content.push({ type: 'text', text: `\n(answered by the bridge of ${OWNER_LABEL.other}, which owns ${sid})` });
+      return result;
+    } catch (e) {
+      return toolError(`${sid} belongs to ${OWNER_LABEL.other}, whose bridge did not answer: ${e.message}`);
+    }
+  }
+  if (owner.kind === 'unreachable') {
+    return toolError(`${sid} belongs to a bridge process (pid ${doc.pid}) of an older version with no control endpoint; use it from the Claude session that started it, or wait until that bridge exits and take it over here`);
+  }
+  // the owner is gone (or this process closed it): answer from disk, or take it over for a follow-up
+  const state = stateOf(doc, owner);
+  if (name === 'zcode_session_send' || name === 'zcode_model_set') {
+    await mgr().adoptSession(sid, { workspacePath: doc.workspace, model: doc.model, turns: doc.turns || 0, fromOwner: doc.owner || `pid ${doc.pid}` });
+    return null;
+  }
+  const lost = state === 'lost' ? 'Its bridge process exited while a turn was running; that turn ended with it. zcode_session_send continues the session here (ZCode keeps its history).' : null;
+  if (name === 'zcode_session_output') {
+    const view = { sessionId: sid, status: state, turnId: doc.turnId, tail: streamTail(sid) || String(doc.lastOutputTail || ''), owner: OWNER_LABEL.gone, ...(lost ? { note: lost } : {}) };
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+  if (name === 'zcode_session_wait') {
+    const view = { sessionId: sid, turnId: doc.turnId, status: state, lastOutput: String(doc.lastOutputTail || ''), model: doc.model, owner: OWNER_LABEL.gone, ...(state === 'done' ? { finalText: finalOf(sid) || doc.finalTextTail } : {}), ...(doc.usage ? { usage: doc.usage } : {}), ...(doc.error ? { error: doc.error } : {}), ...(lost ? { note: lost } : {}) };
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+  if (name === 'zcode_session_status') {
+    const view = Object.assign({}, doc, { state, owner: OWNER_LABEL.gone }, lost ? { note: lost } : {});
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+  // cancel / stop: nothing runs
+  return toolResult(`Nothing runs on ${sid}: its bridge process is gone${state === 'lost' ? ', and the turn that was running ended with it' : ''}. zcode_session_send continues the session here.`, { structuredContent: { sessionId: sid, status: state, interrupted: false } });
+}
+
+/** What zcode_session_attach and zcode_sessions_list say about one session. */
+function sessionView(doc, { tailLines = 25 } = {}) {
+  const local = mgr().sessionInfo(doc.id);
+  const owner = local ? { kind: 'here' } : ownerOf(doc);
+  const state = local ? (local.busy ? 'running' : local.status || 'idle') : stateOf(doc, owner);
+  const tail = streamTail(doc.id, tailLines) || String(doc.lastOutputTail || '').slice(-1500);
+  return {
+    sessionId: doc.id,
+    state,
+    owner: OWNER_LABEL[owner.kind],
+    workspace: doc.workspace,
+    model: doc.model && doc.model.modelId,
+    turns: doc.turns,
+    turnId: doc.turnId,
+    lastActivity: doc.lastActivity ? new Date(doc.lastActivity).toISOString() : null,
+    lastLine: lastLine(tail).slice(0, 200),
+    ...(state === 'running' ? { watch: watchCommand(doc.id) } : {}),
+    tail,
+  };
+}
+
 async function handleToolCall(params) {
   const name = params && params.name;
   const args = (params && params.arguments) || {};
   const token = params && params._meta && params._meta.progressToken;
+
+  // a session this process does not hold: reach it where it is (a call forwarded here is always local)
+  if (FORWARDABLE.has(name) && args.session_id && !params._forwarded && !mgr().sessionInfo(String(args.session_id))) {
+    const routed = await routeRemote(name, args);
+    if (routed) return routed;
+  }
 
   if (name === 'zcode_agent' || name === 'zcode_session_start' || name === 'zcode_session_send') {
     progress(token, 'starting harness session…');
@@ -455,14 +588,55 @@ async function handleToolCall(params) {
   }
 
   if (name === 'zcode_sessions_list') {
-    const sessions = mgr().sessionsList();
-    return toolResult(JSON.stringify({ statusDir: mgr().statusDir, sessions }, null, 2), { structuredContent: { statusDir: mgr().statusDir, sessions } });
+    const all = args.scope === 'all';
+    const limit = Math.max(1, Math.min(Number(args.limit) || 20, 500));
+    const now = Date.now();
+    const views = [];
+    for (const doc of mgr().sessionsList()) {
+      if (!doc || !doc.id) continue;
+      const view = sessionView(doc, { tailLines: 6 });
+      delete view.tail;
+      const open = view.state === 'running' || (!doc.closed && /this Claude session|another Claude session/.test(view.owner));
+      const recentlyLost = view.state === 'lost' && now - (doc.lastActivity || 0) < DAY_MS;
+      // used in the last two hours, whoever owns it (a session with no turn is a throwaway, e.g. zcode_models')
+      const recent = (doc.turns || 0) > 0 && now - (doc.lastActivity || 0) < RECENT_MS;
+      if (!all && !open && !recentlyLost && !recent) continue;
+      views.push(view);
+    }
+    const rank = (v) => (v.state === 'running' ? 0 : v.state === 'lost' ? 1 : 2);
+    views.sort((a, b) => rank(a) - rank(b) || String(b.lastActivity).localeCompare(String(a.lastActivity)));
+    const shown = views.slice(0, limit);
+    const lines = shown.map((v) => `${v.sessionId}  ${v.state.padEnd(9)} ${v.owner}  ${v.model || '?'}  ${v.workspace || ''}  last ${v.lastActivity || '?'}${v.lastLine ? `\n    ${v.lastLine}` : ''}${v.watch ? `\n    follow live: ${v.watch}` : ''}`);
+    const head = all ? `${views.length} sessions on disk` : `${views.length} active sessions (running, open in a live bridge, used in the last 2 h, or lost in the last day)`;
+    const text = [head + (views.length > shown.length ? `, ${shown.length} shown` : ''), ...lines, views.length === 0 && !all ? 'None. scope "all" lists every session on disk.' : ''].filter(Boolean).join('\n');
+    return toolResult(text, { structuredContent: { scope: all ? 'all' : 'active', count: views.length, sessions: shown } });
+  }
+
+  if (name === 'zcode_session_attach') {
+    const sid = String(args.session_id || '');
+    const local = mgr().sessionInfo(sid);
+    const doc = statusDocOf(sid) || (local ? { id: sid, workspace: local.workspacePath, model: local.model, turns: local.turns, turnId: local.turnId, lastActivity: local.lastActivity, lastOutputTail: local.lastOutputTail } : null);
+    if (!doc) return toolError(`unknown session ${sid} (zcode_sessions_list shows the sessions of every bridge)`);
+    const view = sessionView(doc);
+    const how = view.owner === OWNER_LABEL.here
+      ? 'It runs in this Claude session\'s bridge.'
+      : view.owner === OWNER_LABEL.other
+        ? 'Another Claude session owns it: zcode_session_send, zcode_session_output and zcode_session_cancel from here go to its bridge.'
+        : view.owner === OWNER_LABEL.unreachable
+          ? 'An older bridge version owns it and cannot be reached; its live stream can still be followed.'
+          : `Its bridge is gone${view.state === 'lost' ? ' (it exited mid-turn; that turn ended with it)' : ''}: zcode_session_send takes it over here and continues the conversation.`;
+    view.howToUse = view.watch
+      ? `${how} A turn is running: follow it without blocking by running \`watch\` as a background task (Bash, run_in_background: true); you are notified when it ends.`
+      : how;
+    const text = [`${sid}: ${view.state}, owner ${view.owner}, ${view.model || '?'} in ${view.workspace || '?'}`, view.howToUse, view.tail ? `--- current turn ---\n${view.tail}` : '(no output recorded)'].join('\n');
+    return toolResult(text, { structuredContent: view });
   }
 
   if (name === 'zcode_session_status') {
     const info = mgr().sessionInfo(String(args.session_id || ''));
     if (!info) return toolError(`unknown session ${args.session_id}`);
-    return toolResult(JSON.stringify(info, null, 2));
+    const { lastOutputTail, finalTextTail, streamPart, streamAtLineStart, ...rest } = info;
+    return toolResult(JSON.stringify(Object.assign(rest, { owner: OWNER_LABEL.here, lastLine: lastLine(lastOutputTail) }), null, 2));
   }
 
   if (name === 'zcode_session_stop') {
@@ -614,6 +788,40 @@ async function handleToolCall(params) {
 
   return toolError(`unknown tool: ${name}`);
 }
+
+// ------------------------------------------------------------------ control endpoint for other bridges
+// 127.0.0.1, a random port, a random token, both in this process's registry entry. Answers only the
+// session tools, and only for sessions this process holds.
+const CONTROL_TOKEN = registry.newToken();
+const control = require('http').createServer(async (req, res) => {
+  const send = (code, body) => {
+    res.writeHead(code, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+  if (req.headers.authorization !== `Bearer ${CONTROL_TOKEN}`) return send(401, { error: 'unauthorized' });
+  if (req.method !== 'POST' || req.url !== '/tool') return send(404, { error: 'unknown path' });
+  let text = '';
+  for await (const chunk of req) text += chunk;
+  let body;
+  try { body = JSON.parse(text); } catch { return send(400, { error: 'the body is not JSON' }); }
+  const name = body && body.name;
+  const callArgs = (body && body.arguments) || {};
+  if (!FORWARDABLE.has(name)) return send(403, { error: `${name} is not answered for other bridges` });
+  if (!manager || !manager.sessionInfo(String(callArgs.session_id || ''))) return send(404, { error: `session ${callArgs.session_id} is not held by this bridge (any more)` });
+  try {
+    send(200, await handleToolCall({ name, arguments: callArgs, _forwarded: true }));
+  } catch (e) {
+    send(500, { error: e.message });
+  }
+});
+control.on('error', (e) => log('control endpoint error', e.message));
+control.listen(0, '127.0.0.1', () => {
+  try {
+    registry.register(BRIDGES_DIR, { ownerId: OWNER_ID, pid: process.pid, port: control.address().port, token: CONTROL_TOKEN, startedAt: new Date().toISOString(), kind: 'mcp' });
+  } catch (e) { log('bridge registry write failed', e.message); }
+});
+control.unref();
+process.on('exit', () => registry.unregister(BRIDGES_DIR, OWNER_ID));
 
 // ------------------------------------------------------------------ loop
 let buf = '';

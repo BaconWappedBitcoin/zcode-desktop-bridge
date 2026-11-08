@@ -153,7 +153,8 @@ A ready-made system prompt for Claude lives in [`CLAUDE-DESKTOP-PROMPT.md`](CLAU
 | `zcode_session_wait` | block until the current (async) turn finishes — the polling half of `async: true` |
 | `zcode_session_output` | peek at the latest streamed output, non-blocking |
 | `zcode_session_cancel` | cancel the running turn (interrupts via `session/stop`), records status `"cancelled"` |
-| `zcode_sessions_list` | every session in memory **or on disk** — the recovery path for a sessionId lost to a client timeout |
+| `zcode_sessions_list` | the **active** sessions of every bridge process (running, open, used in the last 2 h, or lost), with state, owner, last output line and a live-follow command; `scope: "all"` lists every session on disk |
+| `zcode_session_attach` | connect to a session wherever it runs (another client's bridge, even mid-turn, or a bridge that is gone): state, owner, the live tail, the watcher command; see "Sessions across clients" |
 | `zcode_models` / `zcode_model_set` | list catalog; switch default or live-session model (mid-conversation, history kept) |
 | `zcode_plans` | every plan, which have local credentials, **live token availability** per window |
 | `zcode_plan_route` | which plan currently **has credit** for a model (per-model candidates, 5h/weekly windows, weekly reserve for GLM-5.3; start plans are desktop-only) — `model: "auto:<id>"` on sessions routes automatically |
@@ -342,6 +343,17 @@ Terminal dashboard (`node bin/bridge-ui.cjs`, 140 columns):
 
 *Screenshots use a fictional demo state (made-up sessions, lanes and offers), rendered by the real dashboard code.*
 
+## Sessions across clients
+
+Every client runs its own bridge process (each Claude Code session spawns one), and a session lives in the process that created it: its app-server and its running turn. Before, another client saw such a session only as a file: `zcode_session_status` said "unknown session", and a status file kept saying `running` after its bridge had died mid-turn.
+
+- **Registry and control endpoint.** Each MCP bridge process registers in `out/bridges/<ownerId>.json` (pid, a loopback port, a random token; config `bridgesDir`) and serves `POST /tool` on `127.0.0.1` for the session tools. Every status document carries `owner`.
+- **Any session from any client.** `zcode_session_send`, `zcode_session_output`, `zcode_session_wait`, `zcode_session_cancel`, `zcode_session_status`, `zcode_session_stop` and `zcode_model_set` on a session another live bridge holds are **forwarded** to it. A follow-up there runs in the owner's process, and its live stream can be followed from anywhere (`bin/zcode-watch.cjs` reads files).
+- **A bridge that is gone.** Questions are answered from disk. A follow-up (`zcode_session_send`) **takes the session over**: `session/resume` reopens it from ZCode's own storage in this bridge's app-server, so the conversation continues with its history. A turn that was running when its bridge died is `lost`; ZCode keeps the history up to there.
+- **`zcode_sessions_list`** shows the active sessions of every bridge (running first, then lost, then the rest, newest first), each with its state, owner (`this Claude session`, `another Claude session`, `gone`), latest output line and, for a running turn, the command to follow it. `zcode_session_attach` gives one session's state, owner, live tail and that command.
+
+A bridge of an earlier version has no control endpoint: its sessions show as owned by `another bridge (an older version, not reachable)` until it exits, after which they can be taken over.
+
 ## On-disk session status
 
 Every session is mirrored to `statusDir` (config, default `<repo>/out/sessions/`) so external watchers — bash scripts, another terminal — can follow turns without talking to the bridge:
@@ -401,6 +413,7 @@ Copy `config.example.json` → `config.json`:
 | `asyncByDefault` | `false` | `true`: `zcode_agent`, `zcode_session_start` and `zcode_session_send` return at once unless a call says `async: false`, with a background watcher command to wait with (see "Waiting in the background") |
 | `asyncTurnTimeoutMs` | `21600000` (6 h) | async-turn wait deadline; past it the turn detaches (status stays `running` + `detached`) instead of erroring (see "Async turns") |
 | `statusDir` | `<repo>/out/sessions/` | on-disk session status files (see "On-disk session status") |
+| `bridgesDir` | `<repo>/out/bridges/` | the registry of live bridge processes (see "Sessions across clients") |
 | `offpeakDir` | `<repo>/out/offpeak/` | on-disk idle-time task files (see "On-disk idle-time task status") |
 | `offersPollMs` | `600000` | offer-detector poll interval; `0` disables polling (see "Offer notifications") |
 | `offerToasts` | `true` | raise a Windows toast on new claimable offers |
@@ -445,6 +458,8 @@ node test/ui-state.cjs    # dashboard: aggregator parsing, stale bridge, history
 node test/harness-env.cjs      # install layouts 3.14→3.17: provider-config env, CAS revision candidates, both credential-store layouts (17 checks, temp dirs — no harness)
 node test/model-selection.cjs  # personal default provider + plan activation, per-call overrides, no cross-provider fallback (11 checks, mocked protocol)
 node test/live-stream.cjs      # the live stream and final-answer files, and bin/zcode-watch.cjs following a turn: live, --events, failure (17 checks, mocked protocol)
+node test/bridge-registry.cjs  # the registry of bridge processes: live/dead owners, a call to an owner's control endpoint (10 checks, loopback only)
+node test/two-bridges.cjs      # LIVE: two bridge processes; list, attach, forwarded output/send/wait, then take-over after the owner exits (3 short model turns)
 ```
 
 ## Project layout
