@@ -13,6 +13,7 @@ const { DatabaseSync } = require('node:sqlite');
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zcode-wake-'));
 process.env.ZCODE_TASK_INDEX = path.join(dir, 'tasks-index.sqlite');
 process.env.ZCODE_STORE_DB = path.join(dir, 'db.sqlite');
+process.env.ZCODE_BRIDGE_WAKE_LEDGER = path.join(dir, 'wakes.json');
 const wake = require('../lib/zcode-wake.cjs');
 
 const idx = new DatabaseSync(process.env.ZCODE_TASK_INDEX);
@@ -74,13 +75,33 @@ t('its state follows the app scheduler: pending, dispatched, then the run\'s out
   assert.ok(wake.settled(wake.wakeState(w.automationId)));
 });
 
-t('cleanup removes the automation and its runs and clears the session\'s scheduled-task mark', () => {
+t('a dispatched wake waits while its session still runs a turn or holds it queued', () => {
   assert.deepStrictEqual(wake.listWakes().map((x) => x.automationId), [w.automationId]);
-  assert.strictEqual(wake.sweep(), 1);
+  assert.strictEqual(wake.sweep({ sessionIdle: () => false }), 0);
+  // the app's run record alone is not trusted: a queued run's outcome can stay "running" after its turn
+  idx.prepare("UPDATE automation_runs SET outcome = 'running' WHERE automation_id = ?").run(w.automationId);
+  assert.ok(wake.readyToClean(wake.listWakes()[0], () => true));
+  idx.prepare("UPDATE automation_runs SET outcome = 'succeeded' WHERE automation_id = ?").run(w.automationId);
+});
+
+t('cleanup removes the automation and its runs and clears the session\'s scheduled-task mark', () => {
+  assert.strictEqual(wake.sweep({ sessionIdle: () => true }), 1);
   assert.strictEqual(idx.prepare('SELECT COUNT(*) AS n FROM automations').get().n, 0);
   assert.strictEqual(idx.prepare('SELECT COUNT(*) AS n FROM automation_runs').get().n, 0);
   assert.strictEqual(wake.taskOf('sess_app1').cron_automation_id, null);
   assert.strictEqual(wake.wakeState(w.automationId).state, 'gone');
+});
+
+t('a mark the app writes again after the wake is gone (at the turn\'s end) is cleared too, for an hour', () => {
+  const t0 = Date.now();
+  wake.sweep({ sessionIdle: () => true, now: t0 }); // first seen gone now (the wake was made "at" 1000)
+  idx.prepare('UPDATE tasks SET cron_automation_id = ? WHERE task_id = ?').run(w.automationId, 'sess_app1');
+  assert.strictEqual(wake.pendingCount(), 1, 'kept although it was created long ago');
+  wake.sweep({ sessionIdle: () => true, now: t0 + 30 * 60 * 1000 });
+  assert.strictEqual(wake.taskOf('sess_app1').cron_automation_id, null);
+  assert.strictEqual(wake.pendingCount(), 1);
+  wake.sweep({ sessionIdle: () => true, now: t0 + 2 * 60 * 60 * 1000 });
+  assert.strictEqual(wake.pendingCount(), 0, 'the ledger forgets it an hour after it was seen gone');
 });
 
 t('a wake the app could not dispatch reports its error and counts as settled', () => {
@@ -95,7 +116,7 @@ t('a wake the app could not dispatch reports its error and counts as settled', (
 t('the app\'s limit of 20 scheduled tasks is kept; other automations are never touched', () => {
   for (let i = 0; i < 20; i++) idx.prepare("INSERT INTO automations (automation_id, title, cron_expr, prompt, workspace_key, workspace_path, created_at, updated_at) VALUES (?, 'theirs', '0 9 * * *', 'p', 'w', 'w', 1, 1)").run(`automation-theirs-${i}`);
   assert.throws(() => wake.wake('sess_app1', 'too many'), /limit is 20/);
-  assert.strictEqual(wake.sweep(), 0);
+  assert.strictEqual(wake.sweep({ sessionIdle: () => true }), 0);
   assert.strictEqual(idx.prepare("SELECT COUNT(*) AS n FROM automations WHERE title = 'theirs'").get().n, 20);
   assert.throws(() => wake.wake('sess_cli9', 'x'), /not a task of the ZCode app/);
 });

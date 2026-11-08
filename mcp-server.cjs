@@ -178,13 +178,13 @@ const TOOLS = [
   },
   {
     name: 'zcode_session_send',
-    description: 'Send a prompt to a ZCode session. Idle: it runs as the next turn (run async, the call returns at once with the turnId and a background watcher command to wait with; otherwise it holds the call until the turn finishes). A turn running: the message goes into that session the way ZCode delivers it, chosen by delivery: "steer" (default) reaches the agent inside the running turn after its current tool step; "queue" runs as its own turn once the current one ends (queued messages run in order); "interrupt" stops the running turn and starts a new one with this message. The call returns at once; the live stream (watch command) shows the steer arriving and queued turns running.',
+    description: 'Send a prompt to a ZCode session (a bridge\'s, or one the ZCode app holds). Idle: it runs as the next turn (run async, the call returns at once with the turnId and a background watcher command to wait with; otherwise it holds the call until the turn finishes); an idle ZCode app session is started by the app itself. A turn running: the message goes into that session the way ZCode delivers it, chosen by delivery: "steer" reaches the agent inside the running turn after its current tool step; "queue" runs as its own turn once the current one ends (queued messages run in order); "interrupt" stops the running turn and starts a new one with this message (bridge sessions only). Default: steer for a bridge\'s session; queue for a ZCode app session, where a steer can only arrive as a session message the agent sees as "for reference only" and may decline, while a queued message is a real prompt it acts on. The call returns at once; the live stream (watch command) shows the steer arriving and queued turns running.',
     inputSchema: {
       type: 'object',
       properties: {
         session_id: { type: 'string' },
         prompt: { type: 'string' },
-        delivery: { type: 'string', enum: ['steer', 'queue', 'interrupt'], description: 'Only when a turn is running: steer (default), queue or interrupt.' },
+        delivery: { type: 'string', enum: ['steer', 'queue', 'interrupt'], description: 'Only when a turn is running: steer, queue or interrupt. Default: steer for a bridge\'s session, queue for a ZCode app session.' },
         async: { type: 'boolean', description: ASYNC_PARAM },
       },
       required: ['session_id', 'prompt'],
@@ -473,23 +473,24 @@ const v4words = require('./lib/v4-commands.cjs');
 // it does not. Settled wakes are cleaned up: by this process for its own, and at startup for any left.
 const wake = require('./lib/zcode-wake.cjs');
 const harnessEnv = require('./lib/harness-env.cjs');
-const pendingWakes = new Set();
+// a wake is removed once its session has finished with it: no turn running, nothing of it queued
+const sessionIdle = (sid) => {
+  const e = zstore.getSession(sid);
+  return !e || (e.state !== 'running' && !zstore.pendingInputs(sid).length);
+};
 let wakeTimer = null;
-function trackWake(automationId) {
-  pendingWakes.add(automationId);
+function trackWake() {
   if (wakeTimer) return;
   wakeTimer = setInterval(() => {
-    for (const id of [...pendingWakes]) {
-      try {
-        const st = wake.wakeState(id);
-        if (wake.settled(st)) { if (st.state === 'gone' || wake.cleanup(id)) pendingWakes.delete(id); }
-      } catch { /* the app holds a lock: next round */ }
-    }
-    if (!pendingWakes.size) { clearInterval(wakeTimer); wakeTimer = null; }
+    try { wake.sweep({ sessionIdle }); } catch { /* the app holds a lock: next round */ }
+    if (!wake.pendingCount() && !wake.listWakes().length) { clearInterval(wakeTimer); wakeTimer = null; }
   }, 15000);
   if (wakeTimer.unref) wakeTimer.unref();
 }
-setTimeout(() => { try { wake.sweep(); } catch { /* no task index */ } }, 5000).unref();
+// wakes and marks an earlier bridge process left
+setTimeout(() => {
+  try { wake.sweep({ sessionIdle }); if (wake.pendingCount() || wake.listWakes().length) trackWake(); } catch { /* no task index */ }
+}, 5000).unref();
 const READ_ONLY_NOTE = 'It runs in the ZCode app, which holds it. From here: watch and read it (zcode_session_attach, zcode_session_output, the watch command) and send to it with zcode_session_send: while a turn runs, through ZCode\'s session mailbox (a steer at its next tool step; the app must run with ZCODE_MESSAGE_ENABLED=1); with no turn running, the message starts one (through the app\'s scheduler, or the ZCode CLI when the app is closed). Stop it or change its model in the app.';
 const QUEUE_PREFIX = 'Queued for when you have finished your current task (do not drop what you are doing for it):\n\n';
 const MAILBOX_OFF = 'The ZCode app reads the mailbox only when it runs with ZCODE_MESSAGE_ENABLED=1: set it as a user environment variable, quit ZCode fully (its tray icon too) and start it again.';
@@ -520,11 +521,26 @@ function routeStore(name, sid, args = {}) {
     return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
   }
   if (name === 'zcode_session_send') {
+    // the app's queue (a real prompt right after the running turn) when it is reachable: the agent acts on
+    // that; a mailbox steer reaches it mid-turn but as a "for reference only" session message
+    const appReachable = cfg.wakeIdleSessions !== false && process.env.ZCODE_BRIDGE_WAKE !== '0' && Boolean(wake.taskOf(sid)) && wake.appRunning();
     let delivery;
-    try { delivery = v4words.deliveryOf(args.delivery, 'guide'); } catch (e) { return toolError(e.message); }
+    try { delivery = v4words.deliveryOf(args.delivery, entry.state === 'running' && appReachable ? 'queue' : 'guide'); } catch (e) { return toolError(e.message); }
     if (delivery === 'startNow') return toolError(`${sid} runs in the ZCode app. The bridge reaches it through ZCode's session mailbox, which delivers at tool steps, so it cannot interrupt the turn from here: stop it in the app, or send with delivery "steer" or "queue".`);
     const text = String(args.prompt || '');
     if (!text.trim()) return toolError('prompt is empty');
+    // a turn runs and the message is queued: the app's scheduler hands it to the session's own queue, where it
+    // runs as a real prompt once the turn ends (a mailbox message reaches the agent as a reference note)
+    if (entry.state === 'running' && delivery === 'queue' && appReachable) {
+      try {
+        const w = wake.wake(sid, text);
+        trackWake(w.automationId);
+        const view = { sessionId: sid, status: 'sent', via: 'app-queue', delivery: 'queue', wakeId: w.automationId, state: entry.state, owner: entry.source, watch: watchCommand(sid), note: 'A turn is running: the ZCode app takes the message into the session\'s own queue (through its scheduler, within ~20 s) and runs it as a real prompt as soon as this turn ends.' };
+        return toolResult(`Queued for ${sid} (${entry.source}, "${String(entry.title || '').slice(0, 60)}"): ${view.note}\nFollow it live: ${view.watch}`, { structuredContent: view });
+      } catch (e) {
+        return toolError(`queuing the message for ${sid} through the ZCode app failed: ${e.message}`);
+      }
+    }
     if (entry.state !== 'running' && cfg.wakeIdleSessions !== false && process.env.ZCODE_BRIDGE_WAKE !== '0') {
       // nothing runs in it: start a turn with the message
       const header = `${sid} (${entry.source}, "${String(entry.title || '').slice(0, 60)}") had no turn running`;
@@ -551,7 +567,7 @@ function routeStore(name, sid, args = {}) {
     try { sent = mailbox.send(sid, delivery === 'queue' ? QUEUE_PREFIX + text : text); } catch (e) { return toolError(e.message); }
     const pendingList = mailboxPending(sid, entry);
     const when = entry.state === 'running'
-      ? 'A turn is running: the message reaches the agent after its current tool step (or, if no tool step comes, before the turn ends).'
+      ? 'A turn is running: the message reaches the agent after its current tool step (or, if no tool step comes, before the turn ends). ZCode shows it to the agent as a session message marked "for reference only", which an agent may decline to act on; for an instruction it must follow, send with delivery "queue": it then runs as a real prompt right after this turn.'
       : 'No turn is running: the message arrives with the next prompt given to this session in the app (the mailbox does not wake an idle session).';
     const hint = mailboxHint(pendingList);
     const view = { sessionId: sid, status: 'sent', via: 'mailbox', delivery: delivery === 'queue' ? 'queue' : 'steer', messageId: sent.messageId, state: entry.state, owner: entry.source, pending: pendingList.length, note: [when, 'zcode_session_queue shows whether it was taken.', hint].filter(Boolean).join(' '), ...(entry.state === 'running' ? { watch: watchCommand(sid) } : {}) };
@@ -566,7 +582,6 @@ function routeStore(name, sid, args = {}) {
         const st = wake.wakeState(id);
         if (st.state !== 'pending') return toolError(`${id} is no longer waiting: the app's scheduler already started it (${st.state})`);
         wake.cleanup(id);
-        pendingWakes.delete(id);
       } else {
         const taken = mailbox.cancel(sid, id);
         if (!taken) return toolError(`${id} is no longer waiting: the session already took it (or it never existed)`);
