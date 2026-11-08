@@ -149,11 +149,13 @@ A ready-made system prompt for Claude lives in [`CLAUDE-DESKTOP-PROMPT.md`](CLAU
 | tool | what it does |
 |---|---|
 | `zcode_agent` | one-shot agent turn (full tool access), progress notifications, per-call model override; `async: true` returns `{sessionId, turnId, status:"running"}` immediately |
-| `zcode_session_start` / `send` / `status` / `stop` | persistent multi-turn sessions (`start`/`send` also accept `async: true`) |
+| `zcode_session_start` / `send` / `status` / `stop` | persistent multi-turn sessions (`start`/`send` also accept `async: true`); `send` to a session whose turn is running **steers** it, **queues** the message as the next turn, or **interrupts** with it (`delivery`; see "Talking to a running session") |
+| `zcode_session_queue` | a session's input queue: list, edit, delete, move, send now, pause/resume |
 | `zcode_session_wait` | block until the current (async) turn finishes — the polling half of `async: true` |
 | `zcode_session_output` | peek at the latest streamed output, non-blocking |
 | `zcode_session_cancel` | cancel the running turn (interrupts via `session/stop`), records status `"cancelled"` |
-| `zcode_sessions_list` | every session in memory **or on disk** — the recovery path for a sessionId lost to a client timeout |
+| `zcode_sessions_list` | the **active** sessions of every bridge process and of the ZCode app (running, open, used in the last 2 h, or lost), with state, owner, title, last output line and a live-follow command; `scope: "all"` lists every session on disk |
+| `zcode_session_attach` | connect to a session wherever it runs (another client's bridge, even mid-turn, a bridge that is gone, or the ZCode app): state, owner, the live tail, the watcher command; see "Sessions across clients" |
 | `zcode_models` / `zcode_model_set` | list catalog; switch default or live-session model (mid-conversation, history kept) |
 | `zcode_plans` | every plan, which have local credentials, **live token availability** per window |
 | `zcode_plan_route` | which plan currently **has credit** for a model (per-model candidates, 5h/weekly windows, weekly reserve for GLM-5.3; start plans are desktop-only) — `model: "auto:<id>"` on sessions routes automatically |
@@ -205,7 +207,19 @@ zcode_session_wait    { "session_id": "…", "timeout_s": 60 }     → { status:
 zcode_session_cancel  { "session_id": "…" }                      → { status: "cancelled", interrupted }
 ```
 
-`zcode_session_wait` returns `finalText` (when done), `lastOutput`, `usage {input, output, cacheRead}` and `model`. `zcode_agent` and `zcode_session_send` take the same `async: true` flag; blocking behavior is unchanged without it.
+`zcode_session_wait` returns `finalText` (when done), `lastOutput`, `usage {input, output, cacheRead}` and `model`. `zcode_agent` and `zcode_session_send` take the same `async: true` flag; blocking behavior is unchanged without it. `asyncByDefault: true` in `config.json` makes all three turn-starting tools async unless a call says `async: false`.
+
+### Waiting in the background, with the turn live (Claude Code)
+
+`zcode_session_wait` holds the calling session for as long as it waits: a 600 s wait is ten minutes in which the client does nothing else. Wait in the client's own background tasks instead: every async start returns a watcher command (`watch`, with `howToWait`, in `structuredContent`, which is what Claude Code shows the model):
+
+```
+node "<repo>/bin/zcode-watch.cjs" <sessionId> [--events]
+```
+
+It follows the session's current turn and exits when it ends: `0` done, `1` error, `2` cancelled, `3` the bridge went away mid-turn, `4` no such session. Its output is the turn as it happens (the prompt, the text with each model step on its own line, one `↳ <tool>: <description>  $ <command>` line per tool step and `✗` for a failed one, a footer with time and tokens), then the full final answer. Run through **Bash with `run_in_background: true`**, the session keeps working, the person can watch the turn live in the task's output, and the model is notified once, when it exits. With `--events` it prints only the tool steps and the end, for the **Monitor** tool (a notification per line). The server's `instructions` say the same to every new session.
+
+Claude Code 2.1.317 also carries a client for the MCP Tasks extension ([SEP-2663](https://modelcontextprotocol.io/seps/2663-tasks-extension), `io.modelcontextprotocol/tasks`), which would make a long tool call a native background task by itself; it declares the extension only behind a rollout flag (`out/mcp-client.json` records what a client declared at `initialize`), so the watcher is the way today.
 
 **Async turns detach instead of failing.** Blocking calls error at `turnTimeoutMs` (config, default 900 s) as before. Async turns live under a separate, much larger `asyncTurnTimeoutMs` (config, default **6 h**) — and even past that wait deadline the bridge does **not** record an error: the status file keeps saying `"running"` with `detached: true` (plus `waitDeadlineHitAt`), the event log gains a `turn-detached` line, and the bridge keeps consuming the harness's notifications so the status file still reaches `done`/`error`/`cancelled` with the real `finalText` when the turn actually ends. `zcode_session_wait` on a detached turn keeps returning `running` (with the `detached` flag) until then; `zcode_session_cancel` still interrupts it. Before this fix (≤0.5.0), a long async turn was marked `"error"` at 900 s while the harness kept editing files — external watchers reported a false failure and the final text was lost to the status file.
 
@@ -330,11 +344,61 @@ Terminal dashboard (`node bin/bridge-ui.cjs`, 140 columns):
 
 *Screenshots use a fictional demo state (made-up sessions, lanes and offers), rendered by the real dashboard code.*
 
+## Sessions across clients
+
+Every client runs its own bridge process (each Claude Code session spawns one), and a session lives in the process that created it: its app-server and its running turn. Before, another client saw such a session only as a file: `zcode_session_status` said "unknown session", and a status file kept saying `running` after its bridge had died mid-turn.
+
+- **Registry and control endpoint.** Each MCP bridge process registers in `out/bridges/<ownerId>.json` (pid, a loopback port, a random token; config `bridgesDir`) and serves `POST /tool` on `127.0.0.1` for the session tools. Every status document carries `owner`.
+- **Any session from any client.** `zcode_session_send`, `zcode_session_queue`, `zcode_session_output`, `zcode_session_wait`, `zcode_session_cancel`, `zcode_session_status`, `zcode_session_stop` and `zcode_model_set` on a session another live bridge holds are **forwarded** to it (a steer or queued message too). A follow-up there runs in the owner's process, and its live stream can be followed from anywhere (`bin/zcode-watch.cjs` reads files).
+- **A bridge that is gone.** Questions are answered from disk. A follow-up (`zcode_session_send`) **takes the session over**: `session/resume` reopens it from ZCode's own storage in this bridge's app-server, so the conversation continues with its history. A turn that was running when its bridge died is `lost`; ZCode keeps the history up to there.
+- **`zcode_sessions_list`** shows the active sessions of every bridge (running first, then lost, then the rest, newest first), each with its state, owner (`this Claude session`, `another Claude session`, `gone`), latest output line and, for a running turn, the command to follow it. `zcode_session_attach` gives one session's state, owner, live tail and that command.
+
+A bridge of an earlier version has no control endpoint: its sessions show as owned by `another bridge (an older version, not reachable)` until it exits, after which they can be taken over.
+
+- **The ZCode app's sessions** (and the CLI's) are listed too, from ZCode's own store (`~/.zcode/cli/db/db.sqlite`, `~/.zcode/v2/tasks-index.sqlite`, opened read-only; `lib/zcode-store.cjs`). A turn runs from the first prompt after the last turn ended (`turn_usage` rows are written at a turn's end; a steer sent into a turn is stored like a prompt and stays inside it) until its own row appears; no progress for 15 minutes makes it `stalled`. A running turn whose latest tool step is an unanswered question (`AskUserQuestion`) or plan approval (`ExitPlanMode`) is shown as **waiting for an answer in the app**, with the question: it goes on only once it is answered there, and nothing sent from outside answers it. `zcode_session_attach`/`output`/`status` read it, the watcher follows it live, and `zcode_session_send` reaches it through ZCode's session mailbox (next section). The app holds such a session in its own runtime, so stop it or change its model in the app.
+
+## Talking to a running session
+
+A message for a session whose turn is running goes in the way ZCode delivers it (`zcode_session_send`, `delivery`):
+
+| delivery | what happens |
+|---|---|
+| `steer` (default) | held until the turn's current tool step finishes, then injected into the running turn: the model sees *"The user sent a new message while you were working: …"* before its next step. If the turn ends without another tool step, ZCode runs it as the next turn instead |
+| `queue` | runs as its own turn when the current one ends; queued messages run in order |
+| `interrupt` | the running turn stops and a new one starts with this message |
+
+`zcode_session_queue` shows what waits and changes it: `edit`, `delete`, `move`, `send_now` (interrupt the running turn and run this item), `pause`/`resume`. A stopped turn (`zcode_session_cancel`) **holds** the queue, as in ZCode; `resume` runs it. The live stream and the watcher show it all: `⇢ steer waiting for the next tool step: …`, `» steer delivered: …`, and each queued turn with its own header (`· from the queue`); the watcher follows queued turns and exits when nothing is left to run.
+
+**Sessions of a bridge** use ZCode's V4 conversation protocol over the bridge's own app-server (`lib/v4-commands.cjs`): `v4/command` `sendText` with `requestedDelivery` `guide` / `queue` / `startNow`, the queue commands (compare-and-set on the session revision), and `v4/conversation/subscribe` frames for the revision, phase and queue. ZCode drains its queue by itself after turns started through V4; after a turn the bridge started with `session/send` it re-arms the drain (`setAutoDrain`). Turns that ZCode starts by itself (a queued message, an interrupt) are followed like the bridge's own: live stream, `zcode_session_wait`, final answer.
+
+**Sessions the ZCode app holds**, with a turn running, take a message two ways:
+
+- **`queue` (the default for them)**: the bridge hands the message to the app's scheduler (next paragraph), and the app puts it into the session's **own queue**, where it shows like a follow-up typed in the app (with the app's Steer, edit and delete buttons) and runs as a real prompt as soon as the turn ends. The agent acts on it like on the user's own prompt.
+- **`steer`**: through **ZCode's session mailbox** (`lib/zcode-mailbox.cjs`), the app's channel for messages between sessions: the bridge leaves the message in `~/.zcode/mailbox/<sessionId>/unread/` (written atomically), and the app's runtime takes it at the session's next tool step, or before the turn ends (the turn goes on). It arrives mid-turn, but ZCode wraps it as `<session-message source="mailbox" …>For reference only. Verify against raw source before acting. …</session-message>`, shown so in the app too, and an agent may decline it as a side-channel note (a live test: the agent got the correction after its tool step and said it would not follow it). Use it for information, `queue` for an instruction.
+
+`interrupt` is not possible for these sessions.
+
+Every message for an app session starts with a short header (config `messageHeader`): it comes from Claude, a Claude Code session working with the same user, through the zcode-bridge; Claude reads the session's replies and tool output, so the agent answers Claude simply in its reply. Without it, the agent there sees text from an unknown sender, and an offer such as "ping me" leaves it looking for a tool that does not exist.
+
+**With no turn running**, the message **starts one** (`lib/zcode-wake.cjs`). The mailbox cannot do that (it is read only at a turn's tool steps, its end, or a new prompt), and a turn run by another runtime is no answer either: the app keeps the sessions it has open loaded in its own runtime, and a turn the ZCode CLI (`zcode --resume <id> -p …`) or a bridge runs on such a session lands in the store while the app's loaded copy never sees it — its next turn goes on without it (measured: the CLI's turn was missing from the history of the holder's next model call). So the bridge has the **app run the turn itself**, through its own scheduler: it writes one one-off scheduled task targeting the session (the session's own model, reasoning level, mode and workspace, due now) into `~/.zcode/v2/tasks-index.sqlite`; the app's scheduler, which polls that table every 20 s, claims it and its host resumes the session and sends the message in it — live in the app, the session's history whole. Once the run has settled, the bridge removes that scheduled task and its run rows and clears the scheduled-task mark the app puts on the session (`tasks.cron_automation_id`), so only the turn remains. When the ZCode app is not running, nothing holds the session, and the **ZCode CLI** runs the turn in the background instead. The watch command it returns (`--wait-start`) waits for the turn and follows it. `wakeIdleSessions: false` (or env `ZCODE_BRIDGE_WAKE=0`) leaves such messages in the mailbox instead, for the session's next prompt.
+
+`zcode_session_queue` lists, for a session the app holds, the wakes not started yet, the mailbox messages still waiting and those taken, and the app's own queue; `delete` takes back a wake or a message not taken yet.
+
+The app reads the mailbox only when it runs with **`ZCODE_MESSAGE_ENABLED=1`**, read when it starts. Set it once as a user environment variable, then quit ZCode fully (it keeps running in the tray) and start it again:
+
+```powershell
+[Environment]::SetEnvironmentVariable('ZCODE_MESSAGE_ENABLED', '1', 'User')
+```
+
+Until then messages wait, and the bridge says so: a message still unread after the session went on working is marked `not picked up`. The bridge starts its own app-server with the mailbox on (`sessionMailbox: false` turns that off), so its sessions take messages the same way. Everything stays on this machine: no cloud relay is involved.
+
 ## On-disk session status
 
 Every session is mirrored to `statusDir` (config, default `<repo>/out/sessions/`) so external watchers — bash scripts, another terminal — can follow turns without talking to the bridge:
 
 - `<sessionId>.json` — replaced **atomically** (temp file + rename) on every state change and at most every 5 s while streaming. Never partially written.
+- `<sessionId>.stream.log` — the live, readable stream of every turn, appended as it happens: a header with the prompt, the text (each model step on its own line), one line per tool step, a footer with status, time and tokens. `bin/zcode-watch.cjs` follows it.
+- `<sessionId>.final.md` — the full final answer (or error) of the last finished turn, written before the status says the turn ended.
 - `<sessionId>.log` — one NDJSON line per lifecycle event (`session-created`, `turn-started`, `progress` (≤1/5 s while streaming), `turn-detached`, `turn-completed`, `turn-failed`, `turn-cancelled`, `cancel-requested`, `model-changed`, `session-closed`), each shaped `{ts, sessionId, event, …}`. A summary, not a transcript.
 
 Schema of `<sessionId>.json` (timestamps are epoch ms):
@@ -378,12 +442,19 @@ Copy `config.example.json` → `config.json`:
 | `apiKey` | *(none)* | require matching `x-api-key`/Bearer (env `ZCODE_BRIDGE_API_KEY`) |
 | `workspacePath` | `<repo>/bridge-workspace` | where agent sessions run |
 | `mode` | `yolo` | harness permission mode (auto-approve the agent's own tool use) |
+| `model` | desktop `provider_config.json` default, else `account:zai-individual-coding-plan` / `GLM-5.3-Flash` | bridge default model `{providerId, modelId, options?}`; any harness provider works, including personal API-key providers (e.g. a DeepSeek provider added in ZCode: `{"providerId":"<its uuid>","modelId":"deepseek-v4-pro"}`, see `zcode_models`). Credentialed coding plans are still activated, so per-call `model` overrides like `GLM-5.3` keep resolving. A session never falls back to a different provider than the one asked for |
+| `runtimePrefs` | `{}` | merged into the bridge's answer to `session/requestRuntimePreferences` (base: `nativeSearchEnhancementsEnabled`, `memoryEnabled`, `askUserQuestionAutoResolutionEnabled`, `modelContextBudgetStrategy`). `{"toolSearchMode":"local"}` loads MCP tool schemas on demand instead of with every turn: with ~500 tools from user-level ZCode MCP servers, a trivial turn went from ~148k to ~19k input tokens (values: `off` (harness default), `local`, `auto`) |
 | `modelAliases` | *(map)* | map request model names → harness selections; unknown models use the harness default |
 | `exposeThinking` | `false` | stream harness reasoning as `thinking` blocks |
 | `includeToolActivity` | `false` | log internal tool activity |
 | `turnTimeoutMs` / `sessionIdleMs` | `900000` / `1800000` | blocking-turn cap; idle-session reaping |
+| `asyncByDefault` | `false` | `true`: `zcode_agent`, `zcode_session_start` and `zcode_session_send` return at once unless a call says `async: false`, with a background watcher command to wait with (see "Waiting in the background") |
 | `asyncTurnTimeoutMs` | `21600000` (6 h) | async-turn wait deadline; past it the turn detaches (status stays `running` + `detached`) instead of erroring (see "Async turns") |
 | `statusDir` | `<repo>/out/sessions/` | on-disk session status files (see "On-disk session status") |
+| `bridgesDir` | `<repo>/out/bridges/` | the registry of live bridge processes (see "Sessions across clients") |
+| `sessionMailbox` | `true` | start the bridge's app-server with ZCode's session mailbox on (`ZCODE_MESSAGE_ENABLED=1`), so its sessions take messages left for them (see "Talking to a running session") |
+| `messageHeader` | *(built in)* | the header put before every message the bridge delivers into a ZCode app session: who sent it (Claude, through the zcode-bridge) and how to answer (in its reply: Claude reads the session; the agent has no tool to reach Claude). A string replaces it; `false` sends messages as they are |
+| `wakeIdleSessions` | `true` | a message for a ZCode app session with no turn running starts one (through the app's scheduler, or the ZCode CLI when the app is closed); `false`: it waits in the session's mailbox for its next prompt (env `ZCODE_BRIDGE_WAKE=0` does the same) |
 | `offpeakDir` | `<repo>/out/offpeak/` | on-disk idle-time task files (see "On-disk idle-time task status") |
 | `offersPollMs` | `600000` | offer-detector poll interval; `0` disables polling (see "Offer notifications") |
 | `offerToasts` | `true` | raise a Windows toast on new claimable offers |
@@ -392,17 +463,18 @@ Copy `config.example.json` → `config.json`:
 | `uiWatch` | *(none)* | extra dirs of `<name>.pid/.done/.log` triplets shown as lanes in the dashboard (see "Dashboard") |
 | `uiTailIgnore` | `["Built-in skipped \\(not-due\\)"]` | regex sources for dashboard-tail chatter; the tail shows the last line that matches none of them (`[]` disables) |
 
-Env overrides: `ZCODE_EXE`, `ZCODE_BUNDLE`, `ZCODE_DIR`, `ZCODE_HOME`, `ZCODE_BUILTIN_FILE`, `ZCODE_CREDENTIAL_SECRET`, `ZCODE_PLAN_ORIGIN`, `ZCODE_QUOTA_ORIGIN`.
+Env overrides: `ZCODE_EXE`, `ZCODE_BUNDLE`, `ZCODE_DIR`, `ZCODE_HOME`, `ZCODE_BUILTIN_FILE`, `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`, `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`, `ZCODE_CREDENTIAL_SECRET`, `ZCODE_PLAN_ORIGIN`, `ZCODE_QUOTA_ORIGIN`, `ZCODE_MAILBOX_ROOT` (default `~/.zcode/mailbox`), `ZCODE_STORE_DB`, `ZCODE_TASK_INDEX`.
 
 - `planRouter` — credit-aware routing policy (candidates per model, `weeklyReservePct`, `reserveAppliesTo`, `reserveFor`, `allowStartPlan`, `cacheMs`); see **Plan routing** and `config.example.json`.
 
 ## How it talks to the harness
 
-Verified against ZCode desktop 3.14.4 / agent 0.16.9 (see `proto-probe.cjs`, the instrumented explorer):
+Verified against ZCode desktop 3.14.4 / agent 0.16.9 and 3.17.2 / agent 0.17.1 (see `proto-probe.cjs`, the instrumented explorer):
 
 - The desktop host runs one **ZCode Protocol app-server** per workspace — `ELECTRON_RUN_AS_NODE=1 ZCode.exe zcode.cjs app-server --stdio`, newline-delimited JSON-RPC, no handshake. Sessions: `session/create` → `session/setModel` (needs an explicit `options.reasoningLevel`) → `session/subscribe {deliveryKind:"desktop-continuous"}` → `session/send`. Completion = `v4/telemetry {kind:"turn.terminal"}`; final text lives in `session/messages` parts (`text`, `reasoning`, `step-finish` with usage).
-- Worker app-servers start with account providers **unentitled**. The bridge replays the desktop host's `provider/updateAccountConfig` push; the registry CAS-checks `basedOnZCodeBuiltinRevision` against `zcode-builtin:<revision>:<sha256(active file path)>`, computed from the runtime-cached registry. A session's model list freezes at creation, so entitlement is verified with a session created *after* the push.
-- Model calls trigger a server→client `interaction/requestProviderRuntimeHeaders` request; the bridge answers with the coding-plan API key decrypted from `~/.zcode/v2/credentials.json` (`enc:v1:` = AES-256-GCM with a machine-derivable secret — the same scheme the CLI uses). Keys never leave the process except to the app-server over its private stdio pipe, and are never logged.
+- **ZCode ≥ 3.16** packages the built-in provider config at `resources/config/provider/zcode-builtin.json` instead of next to the CLI bundle. The desktop host hands it to its app-server as `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` plus `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` (`~/.zcode/v2/provider_config.json`; the runtime rejects one without the other), and the bridge does the same. Without them the app-server exits at once with `无法定位 CLI ZCode Built-in Provider Config`. Older layouts get no extra env.
+- Worker app-servers start with account providers **unentitled**. The bridge replays the desktop host's `provider/updateAccountConfig` push; the registry CAS-checks `basedOnZCodeBuiltinRevision` against `zcode-builtin:<revision>:<sha256(active file path)>`, where the active file is the runtime-cached registry (≤ 3.15) or the packaged file above (≥ 3.16). A push with the wrong revision is still answered `"received"` but changes nothing, and a session's model list freezes at creation, so entitlement is verified with a session created *after* the push.
+- Model calls trigger a server→client `interaction/requestProviderRuntimeHeaders` request; the bridge answers with the coding-plan API key decrypted from `~/.zcode/v2/credentials.json` (`enc:v1:` = AES-256-GCM with a machine-derivable secret — the same scheme the CLI uses). Up to 3.16 the key entry is found through an `account-provider:<plan>:identity` entry; 3.17 drops that entry and keeps the account id only in the key entry's name (`account-provider:coding-plan:<plan>:account:<id>:api-key`), which the bridge uses when exactly one account holds the plan. Personal API-key providers need no header answer: the app-server reads their key from `provider_config.json` itself. Keys never leave the process except to the app-server over its private stdio pipe, and are never logged.
 - Plan quota/resets use the desktop's own backend calls: `GET api.z.ai/api/monitor/usage/quota/limit` (plan API key; unit 3 = 5-hour window, unit 6 = weekly) and `zcode.z.ai/api/v1/coding-plan/reset/{status,use,opportunity}` (zcode JWT + MaaS token headers; `reset_type` is `"FIVE_HOUR" | "WEEK"`, idempotency keys must be UUIDs).
 - Idle-time tasks: the app-server has no offPeak RPCs — `offPeak/create`/`offPeak/list` are server→client requests the *host* answers (the desktop from its task service, the bridge from `lib/offpeak.cjs`). Tickets: `zcode.z.ai/api/v1/off-peak/ticket{,/status,/<id>/settle}` + `GET …/ticket/availability` (all live-verified). A ready ticket's run carries `modelExecution.requestAuth` with `X-Off-Peak-Ticket-ID` (plus JWT + plan API key) — that's what makes it free.
 - Offer detection mirrors the desktop's own calls (all read-only, live-verified): `GET zcode.z.ai/api/v1/zcode-plan/billing/preview` (claimable plan list; needs the `X-Device-Mid` header), `GET /api/v1/marketing/touch` (banner/popup campaign deliveries with `ends_at`), and the reset/status read above. The claim endpoint is deliberately **not** implemented anywhere in the bridge (a static test enforces that).
@@ -424,6 +496,15 @@ node test/async-flow.cjs  # async turns, status files, sessions_list, timeout, c
 node test/offpeak.cjs     # idle-time tasks: create/refresh/dispatch/requeue/pause/cancel + host RPCs (46 checks, mocked ticket API — no network)
 node test/offers.cjs      # offer detection: normalize/dedup/expiry/pid-lock + static no-claim-endpoint guard (35 checks, no network)
 node test/ui-state.cjs    # dashboard: aggregator parsing, stale bridge, history buckets, PlanUsageCache, TUI snapshots 80/140 cols + no-claim guard (85 checks, no network)
+node test/harness-env.cjs      # install layouts 3.14→3.17: provider-config env, CAS revision candidates, both credential-store layouts (17 checks, temp dirs — no harness)
+node test/model-selection.cjs  # personal default provider + plan activation, per-call overrides, no cross-provider fallback (11 checks, mocked protocol)
+node test/live-stream.cjs      # the live stream and final-answer files, and bin/zcode-watch.cjs following a turn: live, --events, failure (17 checks, mocked protocol)
+node test/bridge-registry.cjs  # the registry of bridge processes: live/dead owners, a call to an owner's control endpoint (10 checks, loopback only)
+node test/two-bridges.cjs      # LIVE: two bridge processes; list, attach, forwarded output/send/wait, then take-over after the owner exits (3 short model turns)
+node test/v4-commands.cjs      # V4 pieces: delivery names, compare-and-set envelopes, frames into session state, fragment assembly, queue summary (7 checks, no harness)
+node test/steer-queue.cjs      # LIVE (harness, no credits: a scripted mock model, test/helpers/mock-llm.cjs): steer, queue + drain, edit/delete, stop holds the queue, resume, interrupt, and the mailbox into a session another process holds (26 checks)
+node test/zcode-wake.cjs       # waking an idle app session: the one-off scheduled task, its states, cleanup (also of the mark the app writes later), the app's limit of 20, the session's own model (9 checks, temp task index — no app)
+node test/zcode-store.cjs      # the view of ZCode's store: turn state, a steer inside a turn, a turn waiting for an answer in the app, stalled, the app's queue (7 checks, temp store — no app)
 ```
 
 ## Project layout
@@ -432,7 +513,7 @@ node test/ui-state.cjs    # dashboard: aggregator parsing, stale bridge, history
 
 ```
 server.cjs                Anthropic Messages facade (HTTP/SSE) + /v1/offpeak + /v1/offers + /ui dashboard
-mcp-server.cjs            MCP stdio front-end (25 tools)
+mcp-server.cjs            MCP stdio front-end (29 tools)
 bin/bridge-ui.cjs         full-screen TUI dashboard (--once renders one plain frame)
 lib/ui-state.cjs          dashboard state aggregator (pure) + plan-usage disk cache
 lib/ui-html.cjs           the GET /ui page (one self-contained HTML string)
@@ -440,6 +521,12 @@ lib/harness-env.cjs       install discovery, config reads, credential decryption
 lib/zcode-protocol.cjs    ZCode Protocol client + desktop-host request responders
 lib/agent-manager.cjs     sessions, turns, streaming, history import, model/plan switching
 lib/session-status.cjs    on-disk session status (atomic <id>.json + <id>.log NDJSON)
+lib/v4-commands.cjs       V4 conversation commands (steer/queue/interrupt, queue edits) and frame state
+lib/zcode-store.cjs       read-only view of ZCode's own session store (the app's sessions)
+lib/zcode-mailbox.cjs     ZCode's session mailbox: messages for sessions the app holds
+lib/zcode-wake.cjs        start a turn in an idle app session: the app's scheduler, or the CLI
+lib/bridge-registry.cjs   live bridge processes and their control endpoints
+bin/zcode-watch.cjs       follow a turn live (bridge stream files, or ZCode's store), exit at its end
 lib/coding-plan.cjs       plan quota windows + banked resets (Z.ai backend)
 lib/offpeak.cjs           idle-time task host: ticket API, store, poller, run dispatch
 lib/offers.cjs            offer detector: preview/marketing/reset reads, poller, toasts (never claims)

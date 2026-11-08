@@ -8,7 +8,9 @@
  *
  *   zcode_agent          one-shot prompt -> full agent turn -> final text
  *   zcode_session_start  create a persistent session (optional first prompt)
- *   zcode_session_send   run a follow-up turn on a session
+ *   zcode_session_send   run a follow-up turn on a session; while a turn runs: steer it,
+ *                        queue the message as the next turn, or interrupt with it
+ *   zcode_session_queue  a session's input queue: list, edit, delete, move, send now, pause/resume
  *   zcode_session_status inspect a session
  *   zcode_session_stop   stop a running turn
  *   zcode_session_wait   block until the current (async) turn finishes
@@ -60,6 +62,13 @@ function loadConfig() {
 const cfg = loadConfig();
 const log = (...a) => process.stderr.write(`[zcode-mcp] ${new Date().toISOString()} ${a.map(x => (typeof x === 'object' ? JSON.stringify(x) : x)).join(' ')}\n`);
 
+// This process among the other bridge processes (lib/bridge-registry.cjs): every session it creates
+// carries this owner id on disk, and other processes reach its sessions through the control endpoint.
+const registry = require('./lib/bridge-registry.cjs');
+const OWNER_ID = registry.newOwnerId();
+cfg.ownerId = OWNER_ID;
+const BRIDGES_DIR = path.resolve(cfg.bridgesDir || path.join(__dirname, 'out', 'bridges'));
+
 let manager = null;
 function mgr() {
   if (!manager) manager = new AgentManager(cfg, log);
@@ -105,10 +114,44 @@ function toolError(text) {
   return { content: [{ type: 'text', text: String(text) }], isError: true };
 }
 
+// ---------------------------------------------------------------- waiting without blocking
+// A ZCode turn takes minutes. A client that waits on it (a blocking call, or zcode_session_wait) is held for
+// all of that time. bin/zcode-watch.cjs follows a turn live and exits when it ends, so a client with
+// background tasks (Claude Code: Bash run_in_background, or Monitor) waits for it while it keeps working.
+// config asyncByDefault: true makes the turn-starting tools return at once unless a call says async:false.
+const ASYNC_DEFAULT = cfg.asyncByDefault === true;
+const WATCH_SCRIPT = path.join(__dirname, 'bin', 'zcode-watch.cjs').replace(/\\/g, '/');
+const asyncOf = (args) => (args.async === undefined ? ASYNC_DEFAULT : args.async === true);
+const watchCommand = (sessionId) => `node "${WATCH_SCRIPT}" ${sessionId}`;
+// Claude Code hands the model a result's structuredContent, not its text: the guidance rides there too.
+const waitFields = (sessionId) => ({
+  watch: watchCommand(sessionId),
+  howToWait: 'Run `watch` as a background task (Bash, run_in_background: true): its output is the turn live and it exits with the final answer, notifying you once. Keep working meanwhile. Do not call zcode_session_wait: it blocks this session.',
+});
+function backgroundHint(sessionId) {
+  return [
+    'ZCode is working on it in the background. Do not wait with zcode_session_wait: it blocks this whole session.',
+    'To be told when the turn ends and keep working meanwhile, start this as a background task (Bash with run_in_background: true):',
+    `  ${watchCommand(sessionId)}`,
+    'Its output is the turn live (text and each tool step), and it exits with the full final answer: you get one notification then, and read the answer from that output.',
+    'For a notification per tool step instead, run the same command with --events through the Monitor tool.',
+    'Peek without waiting: zcode_session_output. Cancel: zcode_session_cancel.',
+  ].join('\n');
+}
+const ASYNC_PARAM = `Return at once with {sessionId, turnId, status:"running"} instead of holding the call for the whole turn (default ${ASYNC_DEFAULT}). The result names a background watcher command to wait with.`;
+const SERVER_INSTRUCTIONS = [
+  'ZCode turns take minutes. Never hold this session on one.',
+  `Start them with async (${ASYNC_DEFAULT ? 'the default here' : 'async: true'}) on zcode_agent, zcode_session_start or zcode_session_send, then wait in the background:`,
+  `Bash with run_in_background: true running \`node "${WATCH_SCRIPT}" <sessionId>\`. That task's output is the turn live; it exits with the final answer and you are notified once. Keep working meanwhile.`,
+  'Use the Monitor tool with the same command plus --events only when you need to react to each tool step.',
+  'Do not call zcode_session_wait with a long timeout_s: it blocks the session for the whole turn.',
+  'A session with a turn running takes messages too: zcode_session_send steers that turn (default), queues the message as the next turn (delivery "queue") or interrupts with it; zcode_session_queue shows and edits what waits.',
+].join(' ');
+
 const TOOLS = [
   {
     name: 'zcode_agent',
-    description: 'Run a one-shot agent turn in the ZCode harness (full tool access: files, shell, MCP plugins). Returns the final answer text after all internal tool use completes. May take minutes for complex tasks.',
+    description: `Run a one-shot agent turn in the ZCode harness (full tool access: files, shell, MCP plugins). May take minutes. ${ASYNC_DEFAULT ? 'Returns at once and runs in the background (async defaults to true here): wait with the background watcher command the result names.' : 'Without async it returns the final answer once all internal tool use completes; with async:true it returns at once and names a background watcher command to wait with.'}`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -116,39 +159,55 @@ const TOOLS = [
         workspace: { type: 'string', description: 'Optional absolute directory the agent works in (default: the bridge workspace).' },
         reasoning_level: { type: 'string', enum: ['low', 'high', 'max'], description: 'Reasoning effort (default high).' },
         model: { type: 'string', description: 'Optional model override for this call only, e.g. "GLM-5.3" (see zcode_models).' },
-        async: { type: 'boolean', description: 'Return immediately with {sessionId, turnId, status:"running"} instead of waiting for the turn. Then poll zcode_session_wait / zcode_session_output, or zcode_session_cancel.' },
+        async: { type: 'boolean', description: ASYNC_PARAM },
       },
       required: ['prompt'],
     },
   },
   {
     name: 'zcode_session_start',
-    description: 'Create a persistent ZCode harness session (optionally with an opening prompt) for multi-turn orchestration. Returns the sessionId. With async:true and an initial_prompt it returns {sessionId, turnId, status:"running"} immediately.',
+    description: 'Create a persistent ZCode harness session (optionally with an opening prompt) for multi-turn orchestration. Returns the sessionId; with an initial_prompt run async, also the turnId and a background watcher command to wait with.',
     inputSchema: {
       type: 'object',
       properties: {
         initial_prompt: { type: 'string', description: 'Optional first prompt; if omitted the session starts idle.' },
         workspace: { type: 'string' },
-        async: { type: 'boolean', description: 'Start the opening prompt without waiting; poll with zcode_session_wait.' },
+        async: { type: 'boolean', description: ASYNC_PARAM },
       },
     },
   },
   {
     name: 'zcode_session_send',
-    description: 'Send a follow-up prompt to a session created by zcode_session_start and wait for the turn to finish. Emits progress notifications with the latest output. With async:true returns {sessionId, turnId, status:"running"} immediately.',
+    description: 'Send a prompt to a ZCode session (a bridge\'s, or one the ZCode app holds). Idle: it runs as the next turn (run async, the call returns at once with the turnId and a background watcher command to wait with; otherwise it holds the call until the turn finishes); an idle ZCode app session is started by the app itself. A turn running: the message goes into that session the way ZCode delivers it, chosen by delivery: "steer" reaches the agent inside the running turn after its current tool step; "queue" runs as its own turn once the current one ends (queued messages run in order); "interrupt" stops the running turn and starts a new one with this message (bridge sessions only). Default: steer for a bridge\'s session; queue for a ZCode app session, where a steer can only arrive as a session message the agent sees as "for reference only" and may decline, while a queued message is a real prompt it acts on. A message for a ZCode app session starts with a short header saying it comes from Claude through the bridge and that the agent answers simply in its reply (Claude reads the session); write the message itself as to a colleague. The call returns at once; the live stream (watch command) shows the steer arriving and queued turns running.',
     inputSchema: {
       type: 'object',
       properties: {
         session_id: { type: 'string' },
         prompt: { type: 'string' },
-        async: { type: 'boolean', description: 'Start the turn without waiting; poll with zcode_session_wait.' },
+        delivery: { type: 'string', enum: ['steer', 'queue', 'interrupt'], description: 'Only when a turn is running: steer, queue or interrupt. Default: steer for a bridge\'s session, queue for a ZCode app session.' },
+        async: { type: 'boolean', description: ASYNC_PARAM },
       },
       required: ['session_id', 'prompt'],
     },
   },
   {
+    name: 'zcode_session_queue',
+    description: 'A ZCode session\'s input queue: the messages waiting to run as turns once the current one ends (and steers waiting for the next tool step). action: list (default) | edit {queue_item_id, text} | delete {queue_item_id} | move {queue_item_id, before_queue_item_id; none = to the end} | send_now {queue_item_id}: interrupt the running turn and run this item now | pause: queued items wait after turns | resume: they run again (ZCode pauses the queue when a turn is stopped).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        session_id: { type: 'string' },
+        action: { type: 'string', enum: ['list', 'edit', 'delete', 'move', 'send_now', 'pause', 'resume'] },
+        queue_item_id: { type: 'string' },
+        text: { type: 'string', description: 'New text, for edit.' },
+        before_queue_item_id: { type: 'string', description: 'For move: the item to place it before; omit to move it to the end.' },
+      },
+      required: ['session_id'],
+    },
+  },
+  {
     name: 'zcode_session_wait',
-    description: 'Wait for the current turn on a session to finish (use after an async zcode_agent / zcode_session_start / zcode_session_send). Blocks up to timeout_s; returns {status: running|done|error|cancelled (idle if no turn ever ran), finalText when done, lastOutput, usage, model}. Call repeatedly until status is no longer "running".',
+    description: 'BLOCKS the calling session for up to timeout_s: prefer the background watcher command an async start returns (Bash run_in_background), which notifies you when the turn ends while you keep working. Use this with timeout_s 0 to read a finished turn\'s result at once. Returns {status: running|done|error|cancelled (idle if no turn ever ran), finalText when done, lastOutput, usage, model}.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -177,12 +236,23 @@ const TOOLS = [
   },
   {
     name: 'zcode_sessions_list',
-    description: 'List every session this bridge process knows plus every session recorded on disk (the statusDir files), with id, workspace, model, status (idle|running|done|error|cancelled), turns, createdAt, lastActivity, pid — the recovery path for a sessionId lost to a client tool timeout.',
-    inputSchema: { type: 'object', properties: {} },
+    description: 'The ZCode sessions of every bridge process: by default the active ones (a turn running, or open in a live bridge, including those another Claude session started), running first. Each has its state (running | idle | done | error | cancelled | lost: its bridge died mid-turn), its owner (this session, another session, gone), workspace, model, last activity, its latest output line, and for a running one the watcher command to follow it live. Any of them can be used from here: zcode_session_attach, zcode_session_send, zcode_session_output and zcode_session_cancel reach a session another Claude session owns, and take over one whose owner is gone. scope "all" lists every session recorded on disk.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', enum: ['active', 'all'], description: 'active (default): running, open in a live bridge, used in the last 2 h, or lost in the last day; all: every session on disk.' },
+        limit: { type: 'number', description: 'How many to list, newest first (default 20).' },
+      },
+    },
+  },
+  {
+    name: 'zcode_session_attach',
+    description: 'Connect to a ZCode session, wherever it runs: one this Claude session started, one another Claude session started (even mid-turn), or one whose bridge is gone. Returns its state, owner, the live tail of its current turn, and for a running turn the watcher command to follow it in the background (Bash run_in_background). From then on zcode_session_send / zcode_session_output / zcode_session_cancel work on it from here: they go to the bridge that owns it, or take it over (resume it here) when that bridge is gone.',
+    inputSchema: { type: 'object', properties: { session_id: { type: 'string' } }, required: ['session_id'] },
   },
   {
     name: 'zcode_session_status',
-    description: 'Inspect a bridge session (busy, turns, model, age).',
+    description: 'Inspect a ZCode session (busy, turns, model, age), wherever it runs.',
     inputSchema: { type: 'object', properties: { session_id: { type: 'string' } }, required: ['session_id'] },
   },
   {
@@ -329,10 +399,334 @@ const TOOLS = [
 ];
 
 // ---------------------------------------------------------------- handlers
+// ---------------------------------------------------------------- sessions of other bridge processes
+// Each client runs its own bridge process, and a session lives in the one that created it. These tools
+// reach a session wherever it is: in this process; through the control endpoint of the live process that
+// owns it; or, when that process is gone, from disk (read-only questions) or by taking it over here
+// (session/resume) for a follow-up.
+const FORWARDABLE = new Set(['zcode_session_send', 'zcode_session_queue', 'zcode_session_wait', 'zcode_session_output', 'zcode_session_cancel', 'zcode_session_status', 'zcode_session_stop', 'zcode_model_set']);
+const DAY_MS = 24 * 60 * 60 * 1000;
+const RECENT_MS = 2 * 60 * 60 * 1000;
+
+function statusDocOf(sessionId) {
+  try { return JSON.parse(fs.readFileSync(mgr().status.fileFor(sessionId), 'utf8')); } catch { return null; }
+}
+
+/** Where a session on disk is served: here, by another live bridge, by an older bridge with no control endpoint, or nowhere. */
+function ownerOf(doc) {
+  if (!doc) return { kind: 'unknown' };
+  if (doc.owner && doc.owner === OWNER_ID) return { kind: 'here' };
+  if (doc.owner) {
+    const entry = registry.lookup(BRIDGES_DIR, doc.owner);
+    return entry ? { kind: 'other', entry } : { kind: 'gone' };
+  }
+  return registry.alive(doc.pid) && doc.pid !== process.pid ? { kind: 'unreachable' } : { kind: 'gone' };
+}
+const OWNER_LABEL = { here: 'this Claude session', other: 'another Claude session', unreachable: 'another bridge (an older version, not reachable)', gone: 'gone (its bridge process exited)', unknown: 'unknown' };
+const stateOf = (doc, owner) => (doc.status === 'running' && owner.kind === 'gone' ? 'lost' : doc.status || 'idle');
+
+/** The current (last) turn of a session's live stream: its last lines. */
+function streamTail(sessionId, maxLines = 25, maxChars = 3000) {
+  let text = '';
+  try { text = fs.readFileSync(mgr().status.streamFileFor(sessionId), 'utf8'); } catch { return ''; }
+  const headers = [...text.matchAll(/── turn \S+ started/g)];
+  const turn = headers.length ? text.slice(headers[headers.length - 1].index) : text;
+  const lines = turn.trimEnd().split('\n');
+  return lines.slice(-maxLines).join('\n').slice(-maxChars);
+}
+const lastLine = (text) => String(text || '').trim().split('\n').filter((l) => l.trim()).pop() || '';
+const finalOf = (sessionId) => {
+  try { return fs.readFileSync(mgr().status.finalFileFor(sessionId), 'utf8'); } catch { return ''; }
+};
+
+function forwardTimeoutMs(name, args) {
+  if (name === 'zcode_session_wait') return Math.min(Math.max(Number(args.timeout_s) || 60, 0), 600) * 1000 + 15000;
+  if (name === 'zcode_session_send') return asyncOf(args) ? 120000 : (cfg.turnTimeoutMs || 900000) + 30000;
+  return 30000;
+}
+
+// Sessions no bridge started (the ZCode app's, the CLI's): read from ZCode's own store, read-only. Another
+// process (the app) holds them, so from here they can be watched and read, not driven.
+const zstore = require('./lib/zcode-store.cjs');
+const waitingText = (w) => `waiting for an answer in the ZCode app (${w.tool}${w.question ? `: ${w.question}` : ''}); nothing sent from here answers it`;
+function storeView(entry, { tailLines = 25 } = {}) {
+  const tail = zstore.turnText(entry.sessionId, { maxLines: tailLines });
+  return {
+    sessionId: entry.sessionId,
+    state: entry.state,
+    ...(entry.waiting ? { waiting: waitingText(entry.waiting) } : {}),
+    owner: entry.source,
+    title: entry.title,
+    workspace: entry.workspace,
+    model: entry.model,
+    lastActivity: entry.lastActivity ? new Date(entry.lastActivity).toISOString() : null,
+    lastLine: entry.waiting ? waitingText(entry.waiting).slice(0, 200) : lastLine(tail).slice(0, 200),
+    ...(entry.state === 'running' ? { watch: watchCommand(entry.sessionId) } : {}),
+    tail,
+  };
+}
+// Messages reach those sessions through ZCode's session mailbox (lib/zcode-mailbox.cjs): the app's runtime
+// takes them at the session's next tool step (a steer of the running turn), before a turn ends, or with the
+// next prompt; it reads the mailbox only when it runs with ZCODE_MESSAGE_ENABLED=1.
+const mailbox = require('./lib/zcode-mailbox.cjs');
+const v4words = require('./lib/v4-commands.cjs');
+// A session with no turn running is woken instead (lib/zcode-wake.cjs): through the ZCode app's scheduler
+// when the app runs (the app runs the turn itself, so its loaded copy stays whole), with the ZCode CLI when
+// it does not. Settled wakes are cleaned up: by this process for its own, and at startup for any left.
+const wake = require('./lib/zcode-wake.cjs');
+const harnessEnv = require('./lib/harness-env.cjs');
+// a wake is removed once its session has finished with it: no turn running, nothing of it queued
+const sessionIdle = (sid) => {
+  const e = zstore.getSession(sid);
+  return !e || (e.state !== 'running' && !zstore.pendingInputs(sid).length);
+};
+let wakeTimer = null;
+function trackWake() {
+  if (wakeTimer) return;
+  wakeTimer = setInterval(() => {
+    try { wake.sweep({ sessionIdle }); } catch { /* the app holds a lock: next round */ }
+    if (!wake.pendingCount() && !wake.listWakes().length) { clearInterval(wakeTimer); wakeTimer = null; }
+  }, 15000);
+  if (wakeTimer.unref) wakeTimer.unref();
+}
+// wakes and marks an earlier bridge process left
+setTimeout(() => {
+  try { wake.sweep({ sessionIdle }); if (wake.pendingCount() || wake.listWakes().length) trackWake(); } catch { /* no task index */ }
+}, 5000).unref();
+const READ_ONLY_NOTE = 'It runs in the ZCode app, which holds it. From here: watch and read it (zcode_session_attach, zcode_session_output, the watch command) and send to it with zcode_session_send: while a turn runs, through ZCode\'s session mailbox (a steer at its next tool step; the app must run with ZCODE_MESSAGE_ENABLED=1); with no turn running, the message starts one (through the app\'s scheduler, or the ZCode CLI when the app is closed). Stop it or change its model in the app.';
+const QUEUE_PREFIX = 'Queued for when you have finished your current task (do not drop what you are doing for it):\n\n';
+// Who sent a message into a ZCode app session, and how to answer: the agent there has no tool to reach the
+// sender, and does not know that its replies are read. Config messageHeader: a string replaces it, false drops it.
+const DEFAULT_HEADER = '[From Claude: a Claude Code session working with the same user, sent through the zcode-bridge. Claude reads this session\'s replies and tool output through the bridge, so to answer Claude or ask it something, write it in your reply; there is no tool to call for that.]';
+const HEADER = cfg.messageHeader === false ? '' : (typeof cfg.messageHeader === 'string' ? cfg.messageHeader.trim() : DEFAULT_HEADER);
+/** The text delivered into an app session: header, then (queued) the queue line, then the message. */
+const frameMessage = (text, { queued = false } = {}) => `${HEADER ? `${HEADER}\n\n` : ''}${queued ? QUEUE_PREFIX : ''}${text}`;
+/** A delivered text back to {delivery, text}, for the queue view. */
+function unframeMessage(content) {
+  let rest = String(content || '');
+  if (HEADER && rest.startsWith(`${HEADER}\n\n`)) rest = rest.slice(HEADER.length + 2);
+  const queued = rest.startsWith(QUEUE_PREFIX);
+  return { delivery: queued ? 'queue' : 'steer', text: queued ? rest.slice(QUEUE_PREFIX.length) : rest };
+}
+const MAILBOX_OFF = 'The ZCode app reads the mailbox only when it runs with ZCODE_MESSAGE_ENABLED=1: set it as a user environment variable, quit ZCode fully (its tray icon too) and start it again.';
+
+/** Pending mailbox messages of a session, each marked stuck when the session moved on without taking it. */
+function mailboxPending(sid, entry) {
+  return mailbox.pending(sid).map((m) => {
+    const created = Date.parse(m.createdAt) || 0;
+    const stuck = Boolean(entry && entry.state === 'running' && entry.lastActivity && entry.lastActivity > created + 5000);
+    const { delivery, text } = unframeMessage(m.content);
+    return { messageId: m.messageId, delivery, text, createdAt: m.createdAt, ...(stuck ? { stuck: true } : {}) };
+  });
+}
+function mailboxHint(pendingList) {
+  if (pendingList.some((m) => m.stuck)) return `A message is still unread although the session went on working after it was left: the app is running without the mailbox. ${MAILBOX_OFF}`;
+  return mailbox.enabledForNewProcesses() ? '' : `ZCODE_MESSAGE_ENABLED is not set for this user. ${MAILBOX_OFF} Until then messages wait in the mailbox.`;
+}
+
+function routeStore(name, sid, args = {}) {
+  const entry = zstore.available() ? zstore.getSession(sid) : null;
+  if (!entry) return toolError(`unknown session ${sid} (zcode_sessions_list shows the sessions of every bridge and of the ZCode app)`);
+  if (name === 'zcode_session_output') {
+    const view = { sessionId: sid, status: entry.state, tail: zstore.turnText(sid), owner: entry.source, note: READ_ONLY_NOTE };
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+  if (name === 'zcode_session_wait' || name === 'zcode_session_status') {
+    const pendingList = mailboxPending(sid, entry);
+    const view = { sessionId: sid, status: entry.state, title: entry.title, model: entry.model, workspace: entry.workspace, owner: entry.source, lastActivity: entry.lastActivity ? new Date(entry.lastActivity).toISOString() : null, ...(entry.state === 'done' ? { finalText: zstore.finalText(sid) } : {}), ...(entry.turn ? { usage: { input: entry.turn.input_tokens, output: entry.turn.output_tokens }, toolCalls: entry.turn.tool_call_count } : {}), ...(pendingList.length ? { mailboxPending: pendingList } : {}), note: READ_ONLY_NOTE };
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+  if (name === 'zcode_session_send') {
+    // the app's queue (a real prompt right after the running turn) when it is reachable: the agent acts on
+    // that; a mailbox steer reaches it mid-turn but as a "for reference only" session message
+    const appReachable = cfg.wakeIdleSessions !== false && process.env.ZCODE_BRIDGE_WAKE !== '0' && Boolean(wake.taskOf(sid)) && wake.appRunning();
+    let delivery;
+    try { delivery = v4words.deliveryOf(args.delivery, entry.state === 'running' && appReachable ? 'queue' : 'guide'); } catch (e) { return toolError(e.message); }
+    if (delivery === 'startNow') return toolError(`${sid} runs in the ZCode app. The bridge reaches it through ZCode's session mailbox, which delivers at tool steps, so it cannot interrupt the turn from here: stop it in the app, or send with delivery "steer" or "queue".`);
+    const text = String(args.prompt || '');
+    if (!text.trim()) return toolError('prompt is empty');
+    // a turn runs and the message is queued: the app's scheduler hands it to the session's own queue, where it
+    // runs as a real prompt once the turn ends (a mailbox message reaches the agent as a reference note)
+    const waitNote = entry.waiting ? ` The agent is ${waitingText(entry.waiting)}: the turn goes on, and the message reaches it, only once that is answered there.` : '';
+    if (entry.state === 'running' && delivery === 'queue' && appReachable) {
+      try {
+        const w = wake.wake(sid, frameMessage(text));
+        trackWake(w.automationId);
+        const view = { sessionId: sid, status: 'sent', via: 'app-queue', delivery: 'queue', wakeId: w.automationId, state: entry.state, ...(entry.waiting ? { waiting: waitingText(entry.waiting) } : {}), owner: entry.source, watch: watchCommand(sid), note: `A turn is running: the ZCode app takes the message into the session's own queue (through its scheduler, within ~20 s) and runs it as a real prompt as soon as this turn ends.${waitNote}` };
+        return toolResult(`Queued for ${sid} (${entry.source}, "${String(entry.title || '').slice(0, 60)}"): ${view.note}\nFollow it live: ${view.watch}`, { structuredContent: view });
+      } catch (e) {
+        return toolError(`queuing the message for ${sid} through the ZCode app failed: ${e.message}`);
+      }
+    }
+    if (entry.state !== 'running' && cfg.wakeIdleSessions !== false && process.env.ZCODE_BRIDGE_WAKE !== '0') {
+      // nothing runs in it: start a turn with the message
+      const header = `${sid} (${entry.source}, "${String(entry.title || '').slice(0, 60)}") had no turn running`;
+      const watchStart = `${watchCommand(sid)} --wait-start 120`;
+      try {
+        if (wake.taskOf(sid) && wake.appRunning()) {
+          const w = wake.wake(sid, frameMessage(text));
+          trackWake(w.automationId);
+          const view = { sessionId: sid, status: 'sent', via: 'app-scheduler', delivery: 'turn', wakeId: w.automationId, model: w.model, state: entry.state, owner: entry.source, watch: watchStart, note: 'The ZCode app\'s scheduler starts the message as a turn in that session within ~20 s: the app runs it, so it shows there live and the app\'s copy of the session stays whole. The bridge removes the one-off scheduled task it used once the turn has run. zcode_session_queue shows it until it starts (delete takes it back).' };
+          return toolResult(`${header}: the message starts a turn in it through the ZCode app's scheduler (within ~20 s, on ${w.model}). ${view.note}\nFollow it live: ${watchStart}`, { structuredContent: view });
+        }
+        if (!wake.appRunning()) {
+          const located = harnessEnv.locateHarness(cfg);
+          const run = wake.wakeByCli(sid, frameMessage(text), { harness: { exe: located.exe, bundle: located.bundle, env: harnessEnv.providerRuntimeEnv(located.bundle) }, cwd: entry.workspace || undefined, log });
+          const view = { sessionId: sid, status: 'sent', via: 'cli', delivery: 'turn', pid: run.pid, state: entry.state, owner: entry.source, watch: watchStart, note: 'The ZCode app is not running, so nothing holds the session: the ZCode CLI runs the message as a turn in it (in the background, resumed from ZCode\'s store). The app shows it when it next opens the session.' };
+          return toolResult(`${header}: the ZCode CLI runs the message as a turn in it now (pid ${run.pid}). ${view.note}\nFollow it live: ${watchStart}`, { structuredContent: view });
+        }
+      } catch (e) {
+        return toolError(`${header}, and starting a turn failed: ${e.message}`);
+      }
+      // the app runs but does not list it (a session of the CLI): leave it in its mailbox
+    }
+    let sent;
+    try { sent = mailbox.send(sid, frameMessage(text, { queued: delivery === 'queue' })); } catch (e) { return toolError(e.message); }
+    const pendingList = mailboxPending(sid, entry);
+    const when = entry.state === 'running'
+      ? `A turn is running: the message reaches the agent after its current tool step (or, if no tool step comes, before the turn ends). ZCode shows it to the agent as a session message marked "for reference only", which an agent may decline to act on; for an instruction it must follow, send with delivery "queue": it then runs as a real prompt right after this turn.${waitNote}`
+      : 'No turn is running: the message arrives with the next prompt given to this session in the app (the mailbox does not wake an idle session).';
+    const hint = mailboxHint(pendingList);
+    const view = { sessionId: sid, status: 'sent', via: 'mailbox', delivery: delivery === 'queue' ? 'queue' : 'steer', messageId: sent.messageId, state: entry.state, owner: entry.source, pending: pendingList.length, note: [when, 'zcode_session_queue shows whether it was taken.', hint].filter(Boolean).join(' '), ...(entry.state === 'running' ? { watch: watchCommand(sid) } : {}) };
+    return toolResult(`Left for ${sid} (${entry.source}, "${String(entry.title || '').slice(0, 60)}") in ZCode's session mailbox as ${view.delivery}. ${view.note}${view.watch ? `\nFollow it live: ${view.watch}` : ''}`, { structuredContent: view });
+  }
+  if (name === 'zcode_session_queue') {
+    const action = String(args.action || 'list');
+    if (action === 'delete') {
+      if (!args.queue_item_id) return toolError('queue_item_id (a mailbox messageId or a wakeId from action "list") is required for delete');
+      const id = String(args.queue_item_id);
+      if (id.startsWith('automation-')) {
+        const st = wake.wakeState(id);
+        if (st.state !== 'pending') return toolError(`${id} is no longer waiting: the app's scheduler already started it (${st.state})`);
+        wake.cleanup(id);
+      } else {
+        const taken = mailbox.cancel(sid, id);
+        if (!taken) return toolError(`${id} is no longer waiting: the session already took it (or it never existed)`);
+      }
+    } else if (action !== 'list') {
+      return toolError(`${sid} runs in the ZCode app: from here its mailbox messages can be listed and taken back (delete) before the session reads them; edit, reorder or run the app's own queue in the app.`);
+    }
+    const pendingList = mailboxPending(sid, entry);
+    const wakes = wake.listWakes().filter((w) => w.sessionId === sid && !wake.settled(w)).map((w) => ({ wakeId: w.automationId, state: w.state, ...(w.error ? { error: w.error } : {}) }));
+    const view = {
+      sessionId: sid, owner: entry.source, state: entry.state,
+      ...(wakes.length ? { wakes } : {}),
+      mailbox: pendingList,
+      recentlyTaken: mailbox.delivered(sid, 5).map((m) => ({ messageId: m.messageId, readAt: m.readAt, text: unframeMessage(m.content).text })),
+      appQueue: zstore.pendingInputs(sid),
+      ...(action === 'delete' ? { action, done: true } : {}),
+    };
+    const hint = mailboxHint(pendingList);
+    const lines = [
+      `${sid} (${entry.source}, ${entry.state}): ${pendingList.length ? `${pendingList.length} mailbox message(s) not taken yet` : 'no mailbox message waiting'}${view.appQueue.length ? `; ${view.appQueue.length} in the app's own queue` : ''}${action === 'delete' ? ' (delete done)' : ''}`,
+      ...wakes.map((w) => `   wake ${w.wakeId}: ${w.state === 'pending' ? 'waiting for the app\'s scheduler' : w.state}${w.error ? ` — ${w.error}` : ''}`),
+      ...pendingList.map((m, i) => `${i + 1}. ${m.messageId} [${m.delivery}${m.stuck ? ', not picked up' : ''}] ${m.text.replace(/\s+/g, ' ').slice(0, 160)}`),
+      ...view.appQueue.map((q) => `   app queue: [${q.delivery}] ${q.text.replace(/\s+/g, ' ').slice(0, 160)}`),
+      ...view.recentlyTaken.map((m) => `   taken ${m.readAt || ''}: ${m.text.replace(/\s+/g, ' ').slice(0, 120)}`),
+      hint,
+    ].filter(Boolean);
+    return toolResult(lines.join('\n'), { structuredContent: view });
+  }
+  return toolError(`${sid} runs in the ZCode app: stop it or change its model there. ${READ_ONLY_NOTE}`);
+}
+
+/** A session tool for a session this process does not hold: forwarded, answered from disk, or adopted. Returns null to go on locally. */
+async function routeRemote(name, args) {
+  const sid = String(args.session_id || '');
+  const doc = statusDocOf(sid);
+  if (!doc) return routeStore(name, sid, args);
+  const owner = ownerOf(doc);
+  if (owner.kind === 'other') {
+    try {
+      const result = await registry.call(owner.entry, { name, arguments: args }, forwardTimeoutMs(name, args));
+      if (result && result.structuredContent && typeof result.structuredContent === 'object') result.structuredContent.owner = OWNER_LABEL.other;
+      else if (result && Array.isArray(result.content)) result.content.push({ type: 'text', text: `\n(answered by the bridge of ${OWNER_LABEL.other}, which owns ${sid})` });
+      return result;
+    } catch (e) {
+      return toolError(`${sid} belongs to ${OWNER_LABEL.other}, whose bridge did not answer: ${e.message}`);
+    }
+  }
+  if (owner.kind === 'unreachable') {
+    return toolError(`${sid} belongs to a bridge process (pid ${doc.pid}) of an older version with no control endpoint; use it from the Claude session that started it, or wait until that bridge exits and take it over here`);
+  }
+  // the owner is gone (or this process closed it): answer from disk, or take it over for a follow-up
+  const state = stateOf(doc, owner);
+  if (name === 'zcode_session_send' || name === 'zcode_model_set') {
+    await mgr().adoptSession(sid, { workspacePath: doc.workspace, model: doc.model, turns: doc.turns || 0, fromOwner: doc.owner || `pid ${doc.pid}` });
+    return null;
+  }
+  const lost = state === 'lost' ? 'Its bridge process exited while a turn was running; that turn ended with it. zcode_session_send continues the session here (ZCode keeps its history).' : null;
+  if (name === 'zcode_session_output') {
+    const view = { sessionId: sid, status: state, turnId: doc.turnId, tail: streamTail(sid) || String(doc.lastOutputTail || ''), owner: OWNER_LABEL.gone, ...(lost ? { note: lost } : {}) };
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+  if (name === 'zcode_session_wait') {
+    const view = { sessionId: sid, turnId: doc.turnId, status: state, lastOutput: String(doc.lastOutputTail || ''), model: doc.model, owner: OWNER_LABEL.gone, ...(state === 'done' ? { finalText: finalOf(sid) || doc.finalTextTail } : {}), ...(doc.usage ? { usage: doc.usage } : {}), ...(doc.error ? { error: doc.error } : {}), ...(lost ? { note: lost } : {}) };
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+  if (name === 'zcode_session_status') {
+    const view = Object.assign({}, doc, { state, owner: OWNER_LABEL.gone }, lost ? { note: lost } : {});
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+  if (name === 'zcode_session_queue') {
+    const view = { sessionId: sid, status: state, owner: OWNER_LABEL.gone, items: [], note: 'Its bridge process is gone, and its queue with it (ZCode discards queued messages when a session is resumed). zcode_session_send continues the session here.' };
+    return toolResult(JSON.stringify(view, null, 2), { structuredContent: view });
+  }
+  // cancel / stop: nothing runs
+  return toolResult(`Nothing runs on ${sid}: its bridge process is gone${state === 'lost' ? ', and the turn that was running ended with it' : ''}. zcode_session_send continues the session here.`, { structuredContent: { sessionId: sid, status: state, interrupted: false } });
+}
+
+/** What zcode_session_attach and zcode_sessions_list say about one session. */
+function sessionView(doc, { tailLines = 25 } = {}) {
+  const local = mgr().sessionInfo(doc.id);
+  const owner = local ? { kind: 'here' } : ownerOf(doc);
+  const state = local ? (local.busy ? 'running' : local.status || 'idle') : stateOf(doc, owner);
+  const tail = streamTail(doc.id, tailLines) || String(doc.lastOutputTail || '').slice(-1500);
+  return {
+    sessionId: doc.id,
+    state,
+    owner: OWNER_LABEL[owner.kind],
+    workspace: doc.workspace,
+    model: doc.model && doc.model.modelId,
+    turns: doc.turns,
+    turnId: doc.turnId,
+    lastActivity: doc.lastActivity ? new Date(doc.lastActivity).toISOString() : null,
+    lastLine: lastLine(tail).slice(0, 200),
+    ...(state === 'running' ? { watch: watchCommand(doc.id) } : {}),
+    tail,
+  };
+}
+
+/**
+ * Take an argument under its camelCase name too (sessionId for session_id, …): the results speak camelCase
+ * (structuredContent.sessionId), and a model that loads tool schemas lazily tends to reuse the name it read.
+ */
+function normalizeArgs(name, args) {
+  const tool = TOOLS.find((t) => t.name === name);
+  const props = (tool && tool.inputSchema && tool.inputSchema.properties) || {};
+  const out = Object.assign({}, args);
+  for (const [key, value] of Object.entries(args)) {
+    if (key in props) continue;
+    const snake = key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
+    if (snake in props && out[snake] === undefined) { out[snake] = value; delete out[key]; }
+  }
+  return out;
+}
+
 async function handleToolCall(params) {
   const name = params && params.name;
-  const args = (params && params.arguments) || {};
+  const args = normalizeArgs(name, (params && params.arguments) || {});
+  if (params && params.arguments) params.arguments = args; // forwarded to another bridge as normalized
+  const schema = (TOOLS.find((t) => t.name === name) || {}).inputSchema || {};
+  const missing = (schema.required || []).filter((k) => args[k] === undefined || args[k] === null || args[k] === '');
+  if (missing.length) return toolError(`${name} needs ${missing.join(', ')}${missing.includes('session_id') ? ' (a session id such as sess_…, from zcode_sessions_list)' : ''}`);
   const token = params && params._meta && params._meta.progressToken;
+
+  // a session this process does not hold: reach it where it is (a call forwarded here is always local)
+  if (FORWARDABLE.has(name) && args.session_id && !params._forwarded && !mgr().sessionInfo(String(args.session_id))) {
+    const routed = await routeRemote(name, args);
+    if (routed) return routed;
+  }
 
   if (name === 'zcode_agent' || name === 'zcode_session_start' || name === 'zcode_session_send') {
     progress(token, 'starting harness session…');
@@ -346,10 +740,10 @@ async function handleToolCall(params) {
       reasoningLevel: args.reasoning_level,
       ...(modelSel ? { model: modelSel } : {}),
     });
-    if (args.async === true) {
+    if (asyncOf(args)) {
       const started = mgr().startTurn(sessionId, String(args.prompt || ''), {});
-      const text = `sessionId: ${sessionId}\nturnId: ${started.turnId}\nstatus: running\n\nPoll with zcode_session_wait { "session_id": "${sessionId}" }, peek with zcode_session_output, cancel with zcode_session_cancel.`;
-      return toolResult(text, { structuredContent: { sessionId, turnId: started.turnId, status: 'running', model } });
+      const text = `sessionId: ${sessionId}\nturnId: ${started.turnId}\nstatus: running\nmodel: ${model.providerId}/${model.modelId}\n\n${backgroundHint(sessionId)}`;
+      return toolResult(text, { structuredContent: { sessionId, turnId: started.turnId, status: 'running', model, ...waitFields(sessionId) } });
     }
     try {
       const result = await mgr().runTurn(sessionId, String(args.prompt || ''), {
@@ -369,9 +763,9 @@ async function handleToolCall(params) {
   if (name === 'zcode_session_start') {
     const created = await mgr().createSession({ workspacePath: args.workspace });
     if (args.initial_prompt) {
-      if (args.async === true) {
+      if (asyncOf(args)) {
         const started = mgr().startTurn(created.sessionId, String(args.initial_prompt), {});
-        return toolResult(`sessionId: ${created.sessionId}\nturnId: ${started.turnId}\nstatus: running`, { structuredContent: { sessionId: created.sessionId, turnId: started.turnId, status: 'running', model: created.model } });
+        return toolResult(`sessionId: ${created.sessionId}\nturnId: ${started.turnId}\nstatus: running\n\n${backgroundHint(created.sessionId)}`, { structuredContent: { sessionId: created.sessionId, turnId: started.turnId, status: 'running', model: created.model, ...waitFields(created.sessionId) } });
       }
       progress(token, 'running opening prompt…');
       const result = await mgr().runTurn(created.sessionId, String(args.initial_prompt), {
@@ -385,14 +779,44 @@ async function handleToolCall(params) {
   if (name === 'zcode_session_send') {
     const info = mgr().sessionInfo(String(args.session_id || ''));
     if (!info) return toolError(`unknown session ${args.session_id} (start one with zcode_session_start, or recover it with zcode_sessions_list)`);
-    if (args.async === true) {
+    if (info.busy) {
+      // a turn runs: steer it, queue the message, or interrupt with it (V4 sendText delivery)
+      const sid = String(args.session_id);
+      let sent;
+      try { sent = await mgr().sendInput(sid, String(args.prompt || ''), { delivery: args.delivery }); } catch (e) { return toolError(e.message); }
+      const how = {
+        steer: 'It reaches the agent inside the running turn after its current tool step (if the turn ends first, ZCode runs it as the next turn instead).',
+        queue: `It runs as its own turn when the current one ends${sent.position ? ` (position ${sent.position} in the queue)` : ''}.`,
+        interrupt: 'The running turn was interrupted; this message starts a new turn now.',
+      }[sent.admitted] || `ZCode took it as ${sent.admitted}.`;
+      const text = `Sent to ${sid} while its turn runs (${sent.delivery}${sent.admitted !== sent.delivery ? `, delivered as ${sent.admitted}` : ''}). ${how}\nFollow it live: ${watchCommand(sid)}${sent.queue.items.length ? `\nQueue: ${sent.queue.items.map((it) => `${it.queueItemId} [${it.delivery}] ${it.text.slice(0, 60)}`).join(' | ')}` : ''}`;
+      return toolResult(text, { structuredContent: Object.assign({ status: 'sent' }, sent, waitFields(sid)) });
+    }
+    if (asyncOf(args)) {
       const started = mgr().startTurn(String(args.session_id), String(args.prompt || ''), {});
-      return toolResult(`sessionId: ${args.session_id}\nturnId: ${started.turnId}\nstatus: running`, { structuredContent: started });
+      return toolResult(`sessionId: ${args.session_id}\nturnId: ${started.turnId}\nstatus: running\n\n${backgroundHint(String(args.session_id))}`, { structuredContent: Object.assign({}, started, waitFields(String(args.session_id))) });
     }
     const result = await mgr().runTurn(String(args.session_id), String(args.prompt || ''), {
       onDelta: (d) => { if (d.type === 'text') progress(token, d.text.slice(-300)); },
     });
     return toolResult(result.text || '(no textual output)', { structuredContent: { text: result.text, usage: result.usage, finishReason: result.finishReason } });
+  }
+
+  if (name === 'zcode_session_queue') {
+    const sid = String(args.session_id || '');
+    if (!mgr().sessionInfo(sid)) return toolError(`unknown session ${sid} (recover it with zcode_sessions_list)`);
+    const action = String(args.action || 'list');
+    let view;
+    try {
+      view = action === 'list'
+        ? mgr().queueView(sid)
+        : await mgr().queueOp(sid, action, { queueItemId: args.queue_item_id, text: args.text, beforeQueueItemId: args.before_queue_item_id });
+    } catch (e) {
+      return toolError(e.message);
+    }
+    const lines = view.items.map((it, i) => `${i + 1}. ${it.queueItemId} [${it.delivery}${it.state !== 'queued' ? `, ${it.state}` : ''}] ${it.text.replace(/\s+/g, ' ').slice(0, 160)}`);
+    const head = `${sid}: ${view.items.length ? `${view.items.length} waiting` : 'queue empty'}${view.running ? ', a turn is running' : ''}${view.autoDrain ? '' : `; paused (${view.paused}) — action "resume" runs the queue again`}${action !== 'list' ? ` (${action} done)` : ''}`;
+    return toolResult([head, ...lines].join('\n'), { structuredContent: view });
   }
 
   if (name === 'zcode_session_wait') {
@@ -422,14 +846,72 @@ async function handleToolCall(params) {
   }
 
   if (name === 'zcode_sessions_list') {
-    const sessions = mgr().sessionsList();
-    return toolResult(JSON.stringify({ statusDir: mgr().statusDir, sessions }, null, 2), { structuredContent: { statusDir: mgr().statusDir, sessions } });
+    const all = args.scope === 'all';
+    const limit = Math.max(1, Math.min(Number(args.limit) || 20, 500));
+    const now = Date.now();
+    const views = [];
+    for (const doc of mgr().sessionsList()) {
+      if (!doc || !doc.id) continue;
+      const view = sessionView(doc, { tailLines: 6 });
+      delete view.tail;
+      const open = view.state === 'running' || (!doc.closed && /this Claude session|another Claude session/.test(view.owner));
+      const recentlyLost = view.state === 'lost' && now - (doc.lastActivity || 0) < DAY_MS;
+      // used in the last two hours, whoever owns it (a session with no turn is a throwaway, e.g. zcode_models')
+      const recent = (doc.turns || 0) > 0 && now - (doc.lastActivity || 0) < RECENT_MS;
+      if (!all && !open && !recentlyLost && !recent) continue;
+      views.push(view);
+    }
+    // and the sessions no bridge started: the ZCode app's, the CLI's (ZCode's own store, read-only)
+    if (zstore.available()) {
+      const known = new Set(views.map((v) => v.sessionId));
+      for (const entry of zstore.listSessions({ sinceMs: all ? 0 : now - RECENT_MS, limit: all ? limit : 50, now })) {
+        if (known.has(entry.sessionId)) continue;
+        const view = storeView(entry, { tailLines: 6 });
+        delete view.tail;
+        views.push(view);
+      }
+    }
+    const rank = (v) => (v.state === 'running' ? 0 : v.state === 'lost' || v.state === 'stalled' ? 1 : 2);
+    views.sort((a, b) => rank(a) - rank(b) || String(b.lastActivity).localeCompare(String(a.lastActivity)));
+    const shown = views.slice(0, limit);
+    const lines = shown.map((v) => `${v.sessionId}  ${v.state.padEnd(9)} ${v.owner}  ${v.model || '?'}  ${v.title ? `"${String(v.title).slice(0, 60)}"  ` : ''}${v.workspace || ''}  last ${v.lastActivity || '?'}${v.lastLine ? `\n    ${v.lastLine}` : ''}${v.watch ? `\n    follow live: ${v.watch}` : ''}`);
+    const head = all ? `${views.length} sessions` : `${views.length} active sessions (running, open in a live bridge, used in the last 2 h, or lost in the last day; bridges' and the ZCode app's)`;
+    const text = [head + (views.length > shown.length ? `, ${shown.length} shown` : ''), ...lines, views.length === 0 && !all ? 'None. scope "all" lists every session on disk.' : ''].filter(Boolean).join('\n');
+    return toolResult(text, { structuredContent: { scope: all ? 'all' : 'active', count: views.length, sessions: shown } });
+  }
+
+  if (name === 'zcode_session_attach') {
+    const sid = String(args.session_id || '');
+    const local = mgr().sessionInfo(sid);
+    const doc = statusDocOf(sid) || (local ? { id: sid, workspace: local.workspacePath, model: local.model, turns: local.turns, turnId: local.turnId, lastActivity: local.lastActivity, lastOutputTail: local.lastOutputTail } : null);
+    if (!doc) {
+      const entry = zstore.available() ? zstore.getSession(sid) : null;
+      if (!entry) return toolError(`unknown session ${sid} (zcode_sessions_list shows the sessions of every bridge and of the ZCode app)`);
+      const view = storeView(entry);
+      view.howToUse = `${READ_ONLY_NOTE}${view.watch ? ' A turn is running: follow it without blocking by running `watch` as a background task (Bash, run_in_background: true); you are notified when it ends.' : ''}`;
+      const text = [`${sid}: ${view.state}, ${view.owner}, ${view.model || '?'} "${view.title}" in ${view.workspace || '?'}`, view.howToUse, view.tail ? `--- current turn ---\n${view.tail}` : '(no output recorded)'].join('\n');
+      return toolResult(text, { structuredContent: view });
+    }
+    const view = sessionView(doc);
+    const how = view.owner === OWNER_LABEL.here
+      ? 'It runs in this Claude session\'s bridge.'
+      : view.owner === OWNER_LABEL.other
+        ? 'Another Claude session owns it: zcode_session_send, zcode_session_output and zcode_session_cancel from here go to its bridge.'
+        : view.owner === OWNER_LABEL.unreachable
+          ? 'An older bridge version owns it and cannot be reached; its live stream can still be followed.'
+          : `Its bridge is gone${view.state === 'lost' ? ' (it exited mid-turn; that turn ended with it)' : ''}: zcode_session_send takes it over here and continues the conversation.`;
+    view.howToUse = view.watch
+      ? `${how} A turn is running: follow it without blocking by running \`watch\` as a background task (Bash, run_in_background: true); you are notified when it ends.`
+      : how;
+    const text = [`${sid}: ${view.state}, owner ${view.owner}, ${view.model || '?'} in ${view.workspace || '?'}`, view.howToUse, view.tail ? `--- current turn ---\n${view.tail}` : '(no output recorded)'].join('\n');
+    return toolResult(text, { structuredContent: view });
   }
 
   if (name === 'zcode_session_status') {
     const info = mgr().sessionInfo(String(args.session_id || ''));
     if (!info) return toolError(`unknown session ${args.session_id}`);
-    return toolResult(JSON.stringify(info, null, 2));
+    const { lastOutputTail, finalTextTail, streamPart, streamAtLineStart, ...rest } = info;
+    return toolResult(JSON.stringify(Object.assign(rest, { owner: OWNER_LABEL.here, lastLine: lastLine(lastOutputTail) }), null, 2));
   }
 
   if (name === 'zcode_session_stop') {
@@ -582,6 +1064,40 @@ async function handleToolCall(params) {
   return toolError(`unknown tool: ${name}`);
 }
 
+// ------------------------------------------------------------------ control endpoint for other bridges
+// 127.0.0.1, a random port, a random token, both in this process's registry entry. Answers only the
+// session tools, and only for sessions this process holds.
+const CONTROL_TOKEN = registry.newToken();
+const control = require('http').createServer(async (req, res) => {
+  const send = (code, body) => {
+    res.writeHead(code, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(body));
+  };
+  if (req.headers.authorization !== `Bearer ${CONTROL_TOKEN}`) return send(401, { error: 'unauthorized' });
+  if (req.method !== 'POST' || req.url !== '/tool') return send(404, { error: 'unknown path' });
+  let text = '';
+  for await (const chunk of req) text += chunk;
+  let body;
+  try { body = JSON.parse(text); } catch { return send(400, { error: 'the body is not JSON' }); }
+  const name = body && body.name;
+  const callArgs = (body && body.arguments) || {};
+  if (!FORWARDABLE.has(name)) return send(403, { error: `${name} is not answered for other bridges` });
+  if (!manager || !manager.sessionInfo(String(callArgs.session_id || ''))) return send(404, { error: `session ${callArgs.session_id} is not held by this bridge (any more)` });
+  try {
+    send(200, await handleToolCall({ name, arguments: callArgs, _forwarded: true }));
+  } catch (e) {
+    send(500, { error: e.message });
+  }
+});
+control.on('error', (e) => log('control endpoint error', e.message));
+control.listen(0, '127.0.0.1', () => {
+  try {
+    registry.register(BRIDGES_DIR, { ownerId: OWNER_ID, pid: process.pid, port: control.address().port, token: CONTROL_TOKEN, startedAt: new Date().toISOString(), kind: 'mcp' });
+  } catch (e) { log('bridge registry write failed', e.message); }
+});
+control.unref();
+process.on('exit', () => registry.unregister(BRIDGES_DIR, OWNER_ID));
+
 // ------------------------------------------------------------------ loop
 let buf = '';
 process.stdin.setEncoding('utf8');
@@ -596,6 +1112,18 @@ process.stdin.on('data', (d) => {
 });
 process.stdin.on('end', () => { log('stdin closed, exiting'); shutdown(); });
 
+// What the client declared (initialize) and sent along with its last tools/call (_meta), for diagnosing
+// what it supports: out/mcp-client.json. Capabilities and metadata keys only, never arguments.
+const CLIENT_FILE = path.join(__dirname, 'out', 'mcp-client.json');
+const clientSeen = { initialize: null, lastCallMeta: null };
+function recordClient(key, value) {
+  clientSeen[key] = value;
+  try {
+    fs.mkdirSync(path.dirname(CLIENT_FILE), { recursive: true });
+    fs.writeFileSync(CLIENT_FILE, `${JSON.stringify(clientSeen, null, 2)}\n`);
+  } catch { /* diagnostics only */ }
+}
+
 let initialized = false;
 async function dispatch(msg) {
   if (!msg || typeof msg !== 'object') return;
@@ -605,12 +1133,15 @@ async function dispatch(msg) {
     return;
   }
   if (msg.method === 'initialize') {
+    const p = msg.params || {};
+    recordClient('initialize', { at: new Date().toISOString(), protocolVersion: p.protocolVersion, capabilities: p.capabilities, clientInfo: p.clientInfo, metaKeys: Object.keys(p._meta || {}) });
     const clientProto = msg.params && msg.params.protocolVersion;
     const protocolVersion = clientProto || SUPPORTED_PROTOCOL;
     return reply(msg.id, {
       protocolVersion,
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: 'zcode-bridge', version: '0.5.2', title: 'ZCode harness bridge' },
+      instructions: SERVER_INSTRUCTIONS,
     });
   }
   if (msg.method === 'ping') return reply(msg.id, {});
@@ -618,6 +1149,8 @@ async function dispatch(msg) {
     return reply(msg.id, { tools: TOOLS });
   }
   if (msg.method === 'tools/call') {
+    const meta = (msg.params && msg.params._meta) || {};
+    recordClient('lastCallMeta', { at: new Date().toISOString(), tool: msg.params && msg.params.name, meta: Object.fromEntries(Object.entries(meta).filter(([k]) => /capabilit|protocolVersion|progressToken/i.test(k))), keys: Object.keys(meta) });
     try {
       const result = await handleToolCall(msg.params);
       return reply(msg.id, result);
